@@ -22,6 +22,18 @@ Telegram-бот с единым меню для чата, кода, агента
    python bot.py
    ```
 
+## Railway
+
+Создайте сервис из этого репозитория и добавьте в **Variables**:
+
+- `TELEGRAM_BOT_TOKEN`;
+- `HF_TOKEN`;
+- `GEMINI_API_KEY`;
+- `BOT_NAME` (необязательно).
+
+Конфигурация запуска находится в `railway.toml`; Railway запускает worker-команду
+`python bot.py`. Не загружайте `.env` в репозиторий.
+
 ## Модели
 
 Настройки моделей находятся в `config.py`:
