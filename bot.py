@@ -18,11 +18,15 @@ from aiogram.types import (
     Message,
 )
 from huggingface_hub import InferenceClient
+from google import genai
+from google.genai import types
 
 from config import (
     EDIT_MODEL,
+    GEMINI_MODEL,
     IMAGE_MODEL,
     OCR_MODEL,
+    REASONING_MODEL,
     SUPPORT_USERNAME,
     TEXT_MODEL,
     Settings,
@@ -116,11 +120,36 @@ async def hf_text(client: InferenceClient, prompt: str, mode: Mode) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        model=TEXT_MODEL,
+        model=TEXT_MODEL if mode != Mode.AGENT else REASONING_MODEL,
         max_tokens=2048,
         temperature=0.7,
     )
     return result.choices[0].message.content
+
+
+def choose_text_backend(settings: Settings, mode: Mode, prompt: str) -> str:
+    if mode == Mode.CODE:
+        return "deepseek"
+    if mode == Mode.AGENT:
+        return "glm"
+    if settings.gemini_api_key and len(prompt) > 1200:
+        return "gemini"
+    return "gemini" if settings.gemini_api_key else "deepseek"
+
+
+async def gemini_text(settings: Settings, prompt: str, mode: Mode) -> str:
+    client = genai.Client(api_key=settings.gemini_api_key)
+    instruction = {
+        Mode.CHAT: "Отвечай по-русски ясно, точно и полезно.",
+        Mode.CODE: "Реши задачу по программированию. Дай рабочий код и объяснение.",
+        Mode.AGENT: "Разбей задачу на проверяемые шаги и предложи надежное решение.",
+    }[mode]
+    result = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=f"{instruction}\n\n{prompt}",
+    )
+    return result.text
 
 
 async def hf_image(client: InferenceClient, prompt: str, model: str) -> bytes:
@@ -212,6 +241,21 @@ async def hf_vision_answer(
     return result.choices[0].message.content
 
 
+async def gemini_vision_answer(
+    settings: Settings, content: bytes, prompt: str
+) -> str:
+    client = genai.Client(api_key=settings.gemini_api_key)
+    result = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=content, mime_type="image/jpeg"),
+            prompt,
+        ],
+    )
+    return result.text
+
+
 async def send_error(message: Message, error: Exception) -> None:
     logging.exception("Hugging Face request failed", exc_info=error)
     await message.answer(
@@ -295,8 +339,17 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
         await message.answer("Для OCR отправьте изображение или PDF.", reply_markup=back_menu())
         return
     try:
-        client = InferenceClient(token=settings.hf_token)
-        answer = await hf_text(client, message.text, mode)
+        backend = choose_text_backend(settings, mode, message.text)
+        if backend == "gemini":
+            try:
+                answer = await gemini_text(settings, message.text, mode)
+            except Exception:
+                logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
+                answer = await hf_text(
+                    InferenceClient(token=settings.hf_token), message.text, mode
+                )
+        else:
+            answer = await hf_text(InferenceClient(token=settings.hf_token), message.text, mode)
         await message.answer(answer[:4000], reply_markup=back_menu())
     except Exception as error:
         await send_error(message, error)
@@ -311,16 +364,28 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
         buffer = await bot.download_file(file.file_path)
         content = buffer.read()
         client = InferenceClient(token=settings.hf_token)
-        try:
-            extracted = await hf_ocr(client, content)
-        except Exception:
-            logging.warning("GLM-OCR failed; using multimodal DeepSeek fallback", exc_info=True)
-            extracted = await hf_vision_answer(
-                client,
-                content,
-                "Точно распознай текст на фотографии. Сохрани условие задачи, "
-                "формулы, номера и все важные детали.",
-            )
+        if settings.gemini_api_key:
+            try:
+                extracted = await gemini_vision_answer(
+                    settings,
+                    content,
+                    "Распознай текст и условие задачи на фотографии. "
+                    "Сохрани формулы, номера и все важные детали.",
+                )
+            except Exception:
+                logging.warning("Gemini vision failed; using Hugging Face OCR", exc_info=True)
+                extracted = await hf_ocr(client, content)
+        else:
+            try:
+                extracted = await hf_ocr(client, content)
+            except Exception:
+                logging.warning("GLM-OCR failed; using multimodal DeepSeek fallback", exc_info=True)
+                extracted = await hf_vision_answer(
+                    client,
+                    content,
+                    "Точно распознай текст на фотографии. Сохрани условие задачи, "
+                    "формулы, номера и все важные детали.",
+                )
         if not extracted.strip():
             await message.answer("Не удалось распознать текст на фото.", reply_markup=back_menu())
             return
@@ -331,7 +396,14 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
                 f"Реши задачу, распознанную с фотографии. "
                 f"Покажи ход решения и итоговый ответ.\n\n{extracted}"
             )
-            answer = await hf_text(client, prompt, mode)
+            if settings.gemini_api_key:
+                try:
+                    answer = await gemini_text(settings, prompt, mode)
+                except Exception:
+                    logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
+                    answer = await hf_text(client, prompt, mode)
+            else:
+                answer = await hf_text(client, prompt, mode)
         await message.answer(answer[:4000], reply_markup=back_menu())
     except Exception as error:
         await send_error(message, error)
