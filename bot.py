@@ -1,6 +1,9 @@
 import asyncio
 import base64
+import html
+import io
 import logging
+import re
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -13,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     BotCommand,
+    BufferedInputFile,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -119,10 +123,16 @@ async def hf_text(client: InferenceClient, prompt: str, mode: Mode) -> str:
         client.chat_completion,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    "Оформи ответ аккуратно: используй Markdown-заголовки, списки, "
+                    "таблицы и блоки кода. Формулы пиши без $...$.\n\n" + prompt
+                ),
+            },
         ],
         model=TEXT_MODEL if mode != Mode.AGENT else REASONING_MODEL,
-        max_tokens=2048,
+        max_tokens=4096,
         temperature=0.7,
     )
     return result.choices[0].message.content
@@ -148,7 +158,12 @@ async def gemini_text(settings: Settings, prompt: str, mode: Mode) -> str:
     result = await asyncio.to_thread(
         client.models.generate_content,
         model=GEMINI_MODEL,
-        contents=f"{instruction}\n\n{prompt}",
+        contents=(
+            f"{instruction}\n"
+            "Используй Markdown: заголовки, списки, жирный текст, блоки кода и таблицы. "
+            "Формулы пиши читабельно и не используй LaTeX-делимитеры $...$.\n\n"
+            f"{prompt}"
+        ),
     )
     return result.text
 
@@ -266,6 +281,86 @@ async def send_error(message: Message, error: Exception) -> None:
     )
 
 
+def _format_table(lines: list[str]) -> str:
+    rows = []
+    for line in lines:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells and not all(set(cell) <= {"-", ":", " "} for cell in cells):
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    sizes = [max(len(row[index]) for row in rows) for index in range(width)]
+    return "\n".join("  ".join(cell.ljust(sizes[index]) for index, cell in enumerate(row)) for row in rows)
+
+
+def format_answer(text: str) -> str:
+    text = text.replace("\\(", "").replace("\\)", "").replace("\\[", "").replace("\\]", "")
+    output: list[str] = []
+    in_code = False
+    code_lines: list[str] = []
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip().startswith("```"):
+            if in_code:
+                output.append(f"<pre>{html.escape(chr(10).join(code_lines))}</pre>")
+                code_lines = []
+            in_code = not in_code
+            index += 1
+            continue
+        if in_code:
+            code_lines.append(line)
+            index += 1
+            continue
+        if "|" in line and index + 1 < len(lines) and "|" in lines[index + 1]:
+            table_lines = []
+            while index < len(lines) and "|" in lines[index]:
+                table_lines.append(lines[index])
+                index += 1
+            table = _format_table(table_lines)
+            if table:
+                output.append(f"<pre>{html.escape(table)}</pre>")
+                continue
+        escaped = html.escape(line)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", escaped)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        escaped = re.sub(r"^#{1,6}\s+", "<b>", escaped)
+        if escaped.startswith("<b>") and not escaped.endswith("</b>"):
+            escaped += "</b>"
+        output.append(escaped)
+        index += 1
+    if in_code:
+        output.append(f"<pre>{html.escape(chr(10).join(code_lines))}</pre>")
+    result = "\n".join(output).strip()
+    return result or "Пустой ответ."
+
+
+async def send_answer(message: Message, answer: str) -> None:
+    clean_answer = answer.strip()
+    formatted = format_answer(clean_answer)
+    if len(formatted) > 4000:
+        await message.answer(clean_answer[:3900], reply_markup=back_menu())
+    else:
+        await message.answer(formatted, reply_markup=back_menu(), parse_mode="HTML")
+    document = BufferedInputFile(clean_answer.encode("utf-8"), filename="elyra_answer.txt")
+    await message.answer_document(document, caption="📄 Полный ответ в TXT")
+
+
+async def thinking(message: Message) -> Message:
+    return await message.answer("⏳ Думаю над ответом…")
+
+
+async def clear_thinking(status: Message) -> None:
+    try:
+        await status.delete()
+    except TelegramAPIError:
+        logging.debug("Could not remove thinking status", exc_info=True)
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -339,6 +434,7 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
     if mode == Mode.OCR:
         await message.answer("Для OCR отправьте изображение или PDF.", reply_markup=back_menu())
         return
+    status = await thinking(message)
     try:
         backend = choose_text_backend(settings, mode, message.text)
         if backend == "gemini":
@@ -351,14 +447,17 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
                 )
         else:
             answer = await hf_text(InferenceClient(token=settings.hf_token), message.text, mode)
-        await message.answer(answer[:4000], reply_markup=back_menu())
+        await send_answer(message, answer)
     except Exception as error:
         await send_error(message, error)
+    finally:
+        await clear_thinking(status)
 
 
 @router.message(UserFlow.waiting_for_prompt, F.photo)
 async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
+    status = await thinking(message)
     try:
         mode = Mode(data["mode"])
         file = await bot.get_file(message.photo[-1].file_id)
@@ -405,9 +504,11 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
                     answer = await hf_text(client, prompt, mode)
             else:
                 answer = await hf_text(client, prompt, mode)
-        await message.answer(answer[:4000], reply_markup=back_menu())
+        await send_answer(message, answer)
     except Exception as error:
         await send_error(message, error)
+    finally:
+        await clear_thinking(status)
 
 
 @router.message(UserFlow.waiting_for_prompt, F.document)
@@ -416,14 +517,17 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
     if data.get("mode") != Mode.OCR.value:
         await message.answer("В этом режиме нужен текстовый запрос.", reply_markup=back_menu())
         return
+    status = await thinking(message)
     try:
         file = await bot.get_file(message.document.file_id)
         buffer = await bot.download_file(file.file_path)
         client = InferenceClient(token=settings.hf_token)
         answer = await hf_ocr(client, buffer.read())
-        await message.answer(answer[:4000] or "Текст не найден.", reply_markup=back_menu())
+        await send_answer(message, answer or "Текст не найден.")
     except Exception as error:
         await send_error(message, error)
+    finally:
+        await clear_thinking(status)
 
 
 @router.message(UserFlow.waiting_for_image_prompt, F.text)
