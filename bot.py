@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import tempfile
 from enum import Enum
@@ -135,6 +136,18 @@ def temporary_image_path(content: bytes) -> Path:
         return Path(handle.name)
 
 
+def data_uri_for_image(content: bytes) -> str:
+    if content.startswith(b"\x89PNG"):
+        mime_type = "image/png"
+    elif content.startswith(b"GIF8"):
+        mime_type = "image/gif"
+    elif content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        mime_type = "image/webp"
+    else:
+        mime_type = "image/jpeg"
+    return f"data:{mime_type};base64," + base64.b64encode(content).decode("ascii")
+
+
 async def hf_edit(client: InferenceClient, content: bytes, prompt: str) -> bytes:
     image = await asyncio.to_thread(
         client.image_to_image,
@@ -149,11 +162,54 @@ async def hf_edit(client: InferenceClient, content: bytes, prompt: str) -> bytes
 
 async def hf_ocr(client: InferenceClient, content: bytes) -> str:
     result = await asyncio.to_thread(
-        client.image_to_text,
-        image=content,
+        client.chat_completion,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Распознай весь текст на изображении без пропусков. "
+                            "Сохрани номера, формулы и переносы строк."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_uri_for_image(content)
+                        },
+                    },
+                ],
+            }
+        ],
         model=OCR_MODEL,
+        max_tokens=2048,
     )
-    return getattr(result, "text", str(result))
+    return result.choices[0].message.content
+
+
+async def hf_vision_answer(
+    client: InferenceClient, content: bytes, prompt: str
+) -> str:
+    result = await asyncio.to_thread(
+        client.chat_completion,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri_for_image(content)},
+                    },
+                ],
+            }
+        ],
+        model=TEXT_MODEL,
+        max_tokens=2048,
+    )
+    return result.choices[0].message.content
 
 
 async def send_error(message: Message, error: Exception) -> None:
@@ -253,8 +309,18 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
         mode = Mode(data["mode"])
         file = await bot.get_file(message.photo[-1].file_id)
         buffer = await bot.download_file(file.file_path)
+        content = buffer.read()
         client = InferenceClient(token=settings.hf_token)
-        extracted = await hf_ocr(client, buffer.read())
+        try:
+            extracted = await hf_ocr(client, content)
+        except Exception:
+            logging.warning("GLM-OCR failed; using multimodal DeepSeek fallback", exc_info=True)
+            extracted = await hf_vision_answer(
+                client,
+                content,
+                "Точно распознай текст на фотографии. Сохрани условие задачи, "
+                "формулы, номера и все важные детали.",
+            )
         if not extracted.strip():
             await message.answer("Не удалось распознать текст на фото.", reply_markup=back_menu())
             return
