@@ -756,21 +756,49 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
     try:
         file = await bot.get_file(message.voice.file_id)
         buffer = await bot.download_file(file.file_path)
-        prompt = await gemini_transcribe(settings, buffer.read(), "audio/ogg")
+        prompt = await asyncio.wait_for(
+            gemini_transcribe(settings, buffer.read(), "audio/ogg"),
+            timeout=90,
+        )
         if not prompt:
             raise RuntimeError("Расшифровка голосового сообщения пуста.")
         history = await asyncio.to_thread(load_history, message.from_user.id)
-        answer = await gemini_text(settings, prompt, Mode.CHAT, history)
+        try:
+            answer = await asyncio.wait_for(
+                gemini_text(settings, prompt, Mode.CHAT, history),
+                timeout=90,
+            )
+        except Exception:
+            logging.warning("Gemini voice answer failed; falling back to DeepSeek", exc_info=True)
+            answer = await asyncio.wait_for(
+                hf_text(
+                    InferenceClient(token=settings.hf_token),
+                    prompt,
+                    Mode.CHAT,
+                    history,
+                ),
+                timeout=90,
+            )
         await asyncio.to_thread(save_history, message.from_user.id, "user", "[Голос]\n" + prompt)
         await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
         await send_answer(message, answer)
-        audio, filename = await synthesize_speech(answer, settings.tts_voice)
-        if filename.endswith(".ogg"):
-            await message.answer_voice(BufferedInputFile(audio, filename=filename))
-        else:
-            await message.answer_audio(
-                BufferedInputFile(audio, filename=filename),
-                caption="🔊 TTS в MP3: ffmpeg не найден, поэтому отправлен аудиофайл.",
+        try:
+            audio, filename = await asyncio.wait_for(
+                synthesize_speech(answer, settings.tts_voice),
+                timeout=90,
+            )
+            if filename.endswith(".ogg"):
+                await message.answer_voice(BufferedInputFile(audio, filename=filename))
+            else:
+                await message.answer_audio(
+                    BufferedInputFile(audio, filename=filename),
+                    caption="🔊 TTS в MP3: ffmpeg не найден, поэтому отправлен аудиофайл.",
+                )
+        except Exception:
+            logging.warning("Voice synthesis failed; text answer was sent", exc_info=True)
+            await message.answer(
+                "🔊 Голосовой ответ временно недоступен, но текстовый ответ уже отправлен.",
+                reply_markup=back_menu(),
             )
     except Exception as error:
         await send_error(message, error)
