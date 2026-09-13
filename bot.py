@@ -579,7 +579,7 @@ async def clear_history_callback(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.callback_query(F.data == "about")
 async def about_callback(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(ABOUT_TEXT, reply_markup=back_menu(), parse_mode="HTML")
+    await callback.message.answer(ABOUT_TEXT, reply_markup=back_menu(), parse_mode="HTML")
     await callback.answer()
 
 
@@ -588,7 +588,7 @@ async def mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
     mode = Mode(callback.data.split(":", 1)[1])
     await state.clear()
     if mode in (Mode.IMAGE, Mode.EDIT):
-        await callback.message.edit_text(
+        await callback.message.answer(
             "🔧 <b>Технические работы</b>\n\n"
             "Функция изображений временно недоступна. "
             "Остальные возможности Elyra работают.",
@@ -604,7 +604,7 @@ async def mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         await state.set_state(UserFlow.waiting_for_prompt)
     await state.update_data(mode=mode.value)
-    await callback.message.edit_text(prompt_for_mode(mode), reply_markup=back_menu())
+    await callback.message.answer(prompt_for_mode(mode), reply_markup=back_menu())
     await callback.answer()
 
 
