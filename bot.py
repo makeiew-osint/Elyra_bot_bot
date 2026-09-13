@@ -535,10 +535,16 @@ async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "cancel")
 async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text(
-        "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
-        reply_markup=main_menu(),
-    )
+    try:
+        await callback.message.edit_text(
+            "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
+            reply_markup=main_menu(),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
+            reply_markup=main_menu(),
+        )
     await callback.answer("Отменено")
 
 
@@ -734,7 +740,7 @@ async def image_request(message: Message, state: FSMContext, settings: Settings)
             save_history, message.from_user.id, "assistant", "[Изображение создано]"
         )
         path.unlink(missing_ok=True)
-        await state.clear()
+        await state.set_state(UserFlow.waiting_for_image_prompt)
     except Exception as error:
         await send_error(message, error)
     finally:
