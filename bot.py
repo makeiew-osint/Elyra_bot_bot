@@ -290,6 +290,14 @@ def is_gemini_quota_error(error: Exception) -> bool:
     return "resource_exhausted" in text or "exceeded your current quota" in text or "429" in text
 
 
+def is_hf_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in ("hugging face", "huggingface", "inference", "401", "402", "403")
+    )
+
+
 async def answer_smart_text(
     settings: Settings,
     prompt: str,
@@ -314,7 +322,13 @@ async def answer_smart_text(
             return await gemini_text(settings, prompt, mode, history)
         except Exception:
             logging.warning("Gemini smart answer failed; using DeepSeek fallback", exc_info=True)
-    return await hf_text(InferenceClient(token=settings.hf_token), prompt, mode, history)
+    try:
+        return await hf_text(InferenceClient(token=settings.hf_token), prompt, mode, history)
+    except Exception as error:
+        raise RuntimeError(
+            "Резервная модель Hugging Face недоступна. "
+            "Проверьте HF_TOKEN и лимит Hugging Face."
+        ) from error
 
 
 async def gemini_transcribe(settings: Settings, content: bytes, mime_type: str) -> str:
@@ -522,7 +536,13 @@ async def extract_document_text(content: bytes, name: str, mime: str) -> str:
 async def send_error(message: Message, error: Exception) -> None:
     logging.exception("Hugging Face request failed", exc_info=error)
     error_text = str(error)
-    if is_gemini_quota_error(error):
+    if is_hf_error(error) and not is_gemini_quota_error(error):
+        text = (
+            "⚠️ Резервная модель DeepSeek временно недоступна.\n\n"
+            "Проверьте HF_TOKEN и лимит Hugging Face. "
+            "Попробуйте повторить запрос позже."
+        )
+    elif is_gemini_quota_error(error):
         text = (
             "⚠️ Лимит Gemini временно исчерпан.\n\n"
             "Для этого запроса резервная модель тоже недоступна. "
