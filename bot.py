@@ -3,8 +3,11 @@ import base64
 import html
 import io
 import logging
+import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -53,6 +56,7 @@ class Mode(str, Enum):
     OCR = "ocr"
     IMAGE = "image"
     EDIT = "edit"
+    SEARCH = "search"
 
 
 class UserFlow(StatesGroup):
@@ -71,8 +75,9 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="🤖 Агент", callback_data="mode:agent"),
-                InlineKeyboardButton(text="📷 Решить фото", callback_data="mode:ocr"),
+                InlineKeyboardButton(text="📷 Решить фото / 📄 файл", callback_data="mode:ocr"),
             ],
+            [InlineKeyboardButton(text="🌐 Поиск в интернете", callback_data="mode:search")],
             [
                 InlineKeyboardButton(text="🎨 Создать картинку", callback_data="mode:image"),
                 InlineKeyboardButton(text="✏️ Изменить фото", callback_data="mode:edit"),
@@ -106,6 +111,7 @@ ABOUT_TEXT = (
     "💻 <b>Решить код</b> — программирование\n"
     "🤖 <b>Агент</b> — планы и сложные задачи\n"
     "📷 <b>Решить фото</b> — условие с картинки + решение\n"
+    "🌐 <b>Поиск в интернете</b> — актуальные сведения через Gemini\n"
     "🎨 <b>Создать картинку</b> — генерация\n"
     "✏️ <b>Изменить фото</b> — редактирование\n\n"
     "Выберите нужный режим — я помогу разобраться быстро и понятно.\n"
@@ -119,6 +125,7 @@ def prompt_for_mode(mode: Mode) -> str:
         Mode.CODE: "Опишите задачу по коду. Укажите язык и ожидаемый результат:",
         Mode.AGENT: "Опишите цель. Я разложу ее на шаги и предложу решение:",
         Mode.OCR: "Отправьте фото или документ для распознавания текста:",
+        Mode.SEARCH: "Напишите, что найти в интернете:",
         Mode.IMAGE: "Опишите изображение, которое нужно создать:",
         Mode.EDIT: "Сначала отправьте изображение, затем напишите, что изменить:",
     }[mode]
@@ -184,6 +191,7 @@ async def hf_text(
         Mode.CHAT: "Отвечай на русском ясно и полезно.",
         Mode.CODE: "Ты опытный разработчик. Дай рабочий код и кратко объясни решение.",
         Mode.AGENT: "Ты агент-планировщик. Разбей задачу на безопасные проверяемые шаги.",
+        Mode.SEARCH: "Отвечай по-русски, используя актуальные сведения из интернета.",
     }[mode]
     result = await asyncio.to_thread(
         client.chat_completion,
@@ -198,7 +206,7 @@ async def hf_text(
                 ),
             },
         ],
-        model=TEXT_MODEL if mode != Mode.AGENT else REASONING_MODEL,
+        model=TEXT_MODEL if mode not in (Mode.AGENT, Mode.SEARCH) else REASONING_MODEL,
         max_tokens=4096,
         temperature=0.7,
     )
@@ -226,6 +234,7 @@ async def gemini_text(
         Mode.CHAT: "Отвечай по-русски ясно, точно и полезно.",
         Mode.CODE: "Реши задачу по программированию. Дай рабочий код и объяснение.",
         Mode.AGENT: "Разбей задачу на проверяемые шаги и предложи надежное решение.",
+        Mode.SEARCH: "Найди актуальную информацию в интернете и укажи источники.",
     }[mode]
     result = await asyncio.to_thread(
         client.models.generate_content,
@@ -238,6 +247,61 @@ async def gemini_text(
         ),
     )
     return result.text
+
+
+async def gemini_search(settings: Settings, prompt: str) -> str:
+    """Use Gemini grounding when the installed SDK/model supports Google Search."""
+    client = genai.Client(api_key=settings.gemini_api_key)
+    result = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=f"Ответь по-русски на запрос и укажи ссылки на источники:\n{prompt}",
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())]
+        ),
+    )
+    return result.text
+
+
+async def gemini_transcribe(settings: Settings, content: bytes, mime_type: str) -> str:
+    client = genai.Client(api_key=settings.gemini_api_key)
+    result = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=content, mime_type=mime_type),
+            "Точно расшифруй голосовое сообщение на русском языке. Верни только текст.",
+        ],
+    )
+    return (result.text or "").strip()
+
+
+async def synthesize_speech(text: str, voice: str) -> tuple[bytes, str]:
+    """Return Telegram-compatible voice bytes when ffmpeg is available."""
+    import edge_tts
+
+    runtime = Path(__file__).with_name(".runtime")
+    runtime.mkdir(exist_ok=True)
+    mp3_path = runtime / f"tts_{os.getpid()}_{id(text)}.mp3"
+    await edge_tts.Communicate(text[:4000], voice).save(str(mp3_path))
+    ogg_path = mp3_path.with_suffix(".ogg")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp3_path),
+                 "-c:a", "libopus", "-b:a", "64k", str(ogg_path)],
+                check=True,
+                capture_output=True,
+            )
+            return ogg_path.read_bytes(), "voice.ogg"
+        finally:
+            mp3_path.unlink(missing_ok=True)
+            ogg_path.unlink(missing_ok=True)
+    content = mp3_path.read_bytes()
+    mp3_path.unlink(missing_ok=True)
+    return content, "voice.mp3"
 
 
 async def hf_image(client: InferenceClient, prompt: str, model: str) -> bytes:
@@ -383,6 +447,43 @@ async def gemini_vision_answer(
     return result.text
 
 
+async def gemini_document_answer(
+    settings: Settings, content: bytes, mime_type: str, prompt: str
+) -> str:
+    client = genai.Client(api_key=settings.gemini_api_key)
+    result = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_MODEL,
+        contents=[types.Part.from_bytes(data=content, mime_type=mime_type), prompt],
+    )
+    return (result.text or "").strip()
+
+
+async def extract_document_text(content: bytes, name: str, mime: str) -> str:
+    if name.endswith(".txt") or mime.startswith("text/"):
+        return content.decode("utf-8", errors="replace")[:120000]
+    if name.endswith(".docx"):
+        from docx import Document
+        document = Document(io.BytesIO(content))
+        parts = [paragraph.text for paragraph in document.paragraphs]
+        for table in document.tables:
+            parts.append("\n".join(
+                "\t".join(cell.text.strip() for cell in row.cells)
+                for row in table.rows
+            ))
+        return "\n".join(parts)[:120000]
+    if name.endswith((".xlsx", ".xlsm")) or "spreadsheet" in mime:
+        from openpyxl import load_workbook
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        rows = []
+        for sheet in workbook.worksheets:
+            rows.append(f"[Лист: {sheet.title}]")
+            for row in sheet.iter_rows(values_only=True):
+                rows.append("\t".join("" if value is None else str(value) for value in row))
+        return "\n".join(rows)[:120000]
+    raise RuntimeError("Поддерживаются PDF, DOCX, TXT и XLSX.")
+
+
 async def send_error(message: Message, error: Exception) -> None:
     logging.exception("Hugging Face request failed", exc_info=error)
     error_text = str(error)
@@ -515,7 +616,7 @@ async def start(message: Message, state: FSMContext) -> None:
 @router.message(Command("help"))
 async def help_command(message: Message) -> None:
     await message.answer(
-        "Выберите режим в меню и отправьте запрос. Для OCR отправьте фото или PDF.\n"
+        "Выберите режим в меню и отправьте запрос. Можно отправить голос, фото, PDF, DOCX, TXT или XLSX.\n"
         "Команда /cancel сбрасывает текущий режим.",
         reply_markup=main_menu(),
     )
@@ -618,8 +719,11 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
     status = await thinking(message)
     try:
         history = await asyncio.to_thread(load_history, message.from_user.id)
-        backend = choose_text_backend(settings, mode, message.text)
-        if backend == "gemini":
+        if mode == Mode.SEARCH:
+            if not settings.gemini_api_key:
+                raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
+            answer = await gemini_search(settings, message.text)
+        elif choose_text_backend(settings, mode, message.text) == "gemini":
             try:
                 answer = await gemini_text(settings, message.text, mode, history)
             except Exception:
@@ -634,6 +738,40 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
         await asyncio.to_thread(save_history, message.from_user.id, "user", message.text)
         await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
         await send_answer(message, answer)
+    except Exception as error:
+        await send_error(message, error)
+    finally:
+        await clear_thinking(status)
+
+
+@router.message(F.voice)
+async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
+    if not settings.gemini_api_key:
+        await message.answer(
+            "🎙 Для расшифровки голосовых сообщений требуется GEMINI_API_KEY.",
+            reply_markup=back_menu(),
+        )
+        return
+    status = await thinking(message)
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        buffer = await bot.download_file(file.file_path)
+        prompt = await gemini_transcribe(settings, buffer.read(), "audio/ogg")
+        if not prompt:
+            raise RuntimeError("Расшифровка голосового сообщения пуста.")
+        history = await asyncio.to_thread(load_history, message.from_user.id)
+        answer = await gemini_text(settings, prompt, Mode.CHAT, history)
+        await asyncio.to_thread(save_history, message.from_user.id, "user", "[Голос]\n" + prompt)
+        await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
+        await send_answer(message, answer)
+        audio, filename = await synthesize_speech(answer, settings.tts_voice)
+        if filename.endswith(".ogg"):
+            await message.answer_voice(BufferedInputFile(audio, filename=filename))
+        else:
+            await message.answer_audio(
+                BufferedInputFile(audio, filename=filename),
+                caption="🔊 TTS в MP3: ffmpeg не найден, поэтому отправлен аудиофайл.",
+            )
     except Exception as error:
         await send_error(message, error)
     finally:
@@ -777,8 +915,28 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
     try:
         file = await bot.get_file(message.document.file_id)
         buffer = await bot.download_file(file.file_path)
-        client = InferenceClient(token=settings.hf_token)
-        answer = await hf_ocr(client, buffer.read())
+        content = buffer.read()
+        name = (message.document.file_name or "").lower()
+        mime = message.document.mime_type or ""
+        if mime == "application/pdf" or name.endswith(".pdf"):
+            if not settings.gemini_api_key:
+                raise RuntimeError("Анализ PDF требует GEMINI_API_KEY.")
+            answer = await gemini_document_answer(
+                settings, content, "application/pdf",
+                "Извлеки текст из PDF и кратко объясни его содержание.",
+            )
+        else:
+            extracted = await extract_document_text(content, name, mime)
+            if not extracted.strip():
+                raise RuntimeError("В документе не найден текст.")
+            history = await asyncio.to_thread(load_history, message.from_user.id)
+            answer = await gemini_text(
+                settings, "Проанализируй документ:\n\n" + extracted,
+                Mode.CHAT, history
+            ) if settings.gemini_api_key else await hf_text(
+                InferenceClient(token=settings.hf_token),
+                "Проанализируй документ:\n\n" + extracted, Mode.CHAT, history
+            )
         await send_answer(message, answer or "Текст не найден.")
     except Exception as error:
         await send_error(message, error)

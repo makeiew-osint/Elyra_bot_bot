@@ -12,6 +12,7 @@ class Settings:
     hf_token: str
     gemini_api_key: str
     bot_name: str
+    tts_voice: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -27,6 +28,8 @@ class Settings:
             hf_token=hf_token,
             gemini_api_key=gemini_api_key,
             bot_name=os.getenv("BOT_NAME", "Elyra_bot_bot").strip() or "Elyra_bot_bot",
+            tts_voice=os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural").strip()
+            or "ru-RU-SvetlanaNeural",
         )
 
 
