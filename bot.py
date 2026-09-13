@@ -285,6 +285,11 @@ async def gemini_search(settings: Settings, prompt: str) -> str:
     return result.text
 
 
+def is_gemini_quota_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return "resource_exhausted" in text or "exceeded your current quota" in text or "429" in text
+
+
 async def answer_smart_text(
     settings: Settings,
     prompt: str,
@@ -295,8 +300,14 @@ async def answer_smart_text(
         if settings.gemini_api_key:
             try:
                 return await gemini_search(settings, prompt)
-            except Exception:
+            except Exception as error:
                 logging.warning("Grounded search failed; using regular model fallback", exc_info=True)
+                if is_gemini_quota_error(error):
+                    logging.warning("Gemini quota exhausted; skipping Gemini regular chat fallback")
+                    mode = Mode.CHAT
+                    return await hf_text(
+                        InferenceClient(token=settings.hf_token), prompt, mode, history
+                    )
         mode = Mode.CHAT
     if choose_text_backend(settings, mode, prompt) == "gemini":
         try:
@@ -511,7 +522,13 @@ async def extract_document_text(content: bytes, name: str, mime: str) -> str:
 async def send_error(message: Message, error: Exception) -> None:
     logging.exception("Hugging Face request failed", exc_info=error)
     error_text = str(error)
-    if "402" in error_text or "depleted your monthly included credits" in error_text:
+    if is_gemini_quota_error(error):
+        text = (
+            "⚠️ Лимит Gemini временно исчерпан.\n\n"
+            "Для этого запроса резервная модель тоже недоступна. "
+            "Попробуйте повторить позже или пополните квоту Gemini."
+        )
+    elif "402" in error_text or "depleted your monthly included credits" in error_text:
         text = (
             "💳 Лимит генерации изображений Hugging Face исчерпан.\n\n"
             "Пополните кредиты или подключите тариф Hugging Face, "
@@ -777,12 +794,6 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
 
 @router.message(F.content_type.in_({"voice", "audio"}))
 async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
-    if not settings.gemini_api_key:
-        await message.answer(
-            "🎙 Для расшифровки голосовых сообщений требуется GEMINI_API_KEY.",
-            reply_markup=back_menu(),
-        )
-        return
     status = await thinking(message)
     try:
         media = message.voice if message.content_type == "voice" else message.audio
@@ -799,6 +810,11 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
             )
         except Exception:
             logging.warning("Whisper transcription failed; using Gemini fallback", exc_info=True)
+            if not settings.gemini_api_key:
+                raise RuntimeError(
+                    "Не удалось расшифровать голос через Whisper. "
+                    "Проверьте HF_TOKEN или добавьте GEMINI_API_KEY."
+                )
             prompt = await asyncio.wait_for(
                 gemini_transcribe(settings, content, mime_type),
                 timeout=90,
