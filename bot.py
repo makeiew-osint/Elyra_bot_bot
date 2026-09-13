@@ -385,9 +385,21 @@ async def gemini_vision_answer(
 
 async def send_error(message: Message, error: Exception) -> None:
     logging.exception("Hugging Face request failed", exc_info=error)
+    error_text = str(error)
+    if "402" in error_text or "depleted your monthly included credits" in error_text:
+        text = (
+            "💳 Лимит генерации изображений Hugging Face исчерпан.\n\n"
+            "Пополните кредиты или подключите тариф Hugging Face, "
+            "после чего генерация снова заработает.\n"
+            "Текстовый чат и решение задач продолжают работать."
+        )
+    else:
+        text = (
+            "Не удалось обработать запрос. Проверьте доступность сервиса "
+            "или обратитесь в поддержку @Makeiew."
+        )
     await message.answer(
-        "Не удалось обработать запрос. Проверьте доступность модели Hugging Face "
-        "или обратитесь в поддержку @Makeiew.",
+        text,
         reply_markup=back_menu(),
     )
 
