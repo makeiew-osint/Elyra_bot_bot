@@ -83,7 +83,10 @@ def main_menu() -> InlineKeyboardMarkup:
 def back_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
+            [
+                InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel"),
+                InlineKeyboardButton(text="⌂ Главное меню", callback_data="menu"),
+            ],
             [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
         ]
     )
@@ -97,8 +100,8 @@ ABOUT_TEXT = (
     "📷 <b>Решить фото</b> — условие с картинки + решение\n"
     "🎨 <b>Создать картинку</b> — генерация\n"
     "✏️ <b>Изменить фото</b> — редактирование\n\n"
-    "Модели: DeepSeek V4.1 Flash, GLM-OCR, Krea-2-Turbo и FLUX.2-dev.\n"
-    "Поддержка: @Makeiew"
+    "Выберите нужный режим — я помогу разобраться быстро и понятно.\n"
+    "🆘 Поддержка: @Makeiew"
 )
 
 
@@ -390,7 +393,10 @@ async def about_command(message: Message) -> None:
 @router.message(Command("cancel"))
 async def cancel_command(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Текущий режим отменен.", reply_markup=main_menu())
+    await message.answer(
+        "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
+        reply_markup=main_menu(),
+    )
 
 
 @router.callback_query(F.data == "menu")
@@ -402,6 +408,16 @@ async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "cancel")
+async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
+        reply_markup=main_menu(),
+    )
+    await callback.answer("Отменено")
 
 
 @router.callback_query(F.data == "about")
