@@ -583,9 +583,17 @@ async def about_callback(callback: CallbackQuery) -> None:
 async def mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
     mode = Mode(callback.data.split(":", 1)[1])
     await state.clear()
-    if mode == Mode.EDIT:
-        await state.set_state(UserFlow.waiting_for_edit_image)
-    elif mode in (Mode.IMAGE,):
+    if mode in (Mode.IMAGE, Mode.EDIT):
+        await callback.message.edit_text(
+            "🔧 <b>Технические работы</b>\n\n"
+            "Функция изображений временно недоступна. "
+            "Остальные возможности Elyra работают.",
+            reply_markup=back_menu(),
+            parse_mode="HTML",
+        )
+        await callback.answer("Технические работы")
+        return
+    if mode in (Mode.IMAGE,):
         await state.set_state(UserFlow.waiting_for_image_prompt)
     elif mode == Mode.OCR:
         await state.set_state(UserFlow.waiting_for_prompt)
