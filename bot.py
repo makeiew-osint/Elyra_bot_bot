@@ -6,6 +6,7 @@ from enum import Enum
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -474,18 +475,17 @@ async def edit_request(
 async def main() -> None:
     settings = Settings.from_env()
     bot = Bot(settings.telegram_token)
-    await bot.set_my_name(name=settings.bot_name)
-    await bot.set_my_description(
-        description="AI-помощник: чат, кодинг, OCR, генерация и редактирование изображений."
-    )
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Главное меню"),
-            BotCommand(command="help", description="Помощь"),
-            BotCommand(command="about", description="О боте"),
-            BotCommand(command="cancel", description="Отменить режим"),
-        ]
-    )
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="help", description="Помощь"),
+                BotCommand(command="about", description="О боте"),
+                BotCommand(command="cancel", description="Отменить режим"),
+            ]
+        )
+    except TelegramAPIError:
+        logging.warning("Bot command setup skipped; Telegram rate limit or API error")
     dp = Dispatcher()
     dp["settings"] = settings
     dp.include_router(router)
