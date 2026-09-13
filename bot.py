@@ -211,13 +211,9 @@ async def hf_text(
 
 
 def choose_text_backend(settings: Settings, mode: Mode, prompt: str) -> str:
-    if mode == Mode.CODE:
-        return "deepseek"
     if mode == Mode.AGENT:
         return "glm"
-    if settings.gemini_api_key and len(prompt) > 1200:
-        return "gemini"
-    return "gemini" if settings.gemini_api_key else "deepseek"
+    return "deepseek"
 
 
 def smart_mode(prompt: str) -> Mode:
@@ -310,18 +306,8 @@ async def answer_smart_text(
                 return await gemini_search(settings, prompt)
             except Exception as error:
                 logging.warning("Grounded search failed; using regular model fallback", exc_info=True)
-                if is_gemini_quota_error(error):
-                    logging.warning("Gemini quota exhausted; skipping Gemini regular chat fallback")
-                    mode = Mode.CHAT
-                    return await hf_text(
-                        InferenceClient(token=settings.hf_token), prompt, mode, history
-                    )
+    if mode == Mode.SEARCH:
         mode = Mode.CHAT
-    if choose_text_backend(settings, mode, prompt) == "gemini":
-        try:
-            return await gemini_text(settings, prompt, mode, history)
-        except Exception:
-            logging.warning("Gemini smart answer failed; using DeepSeek fallback", exc_info=True)
     try:
         return await hf_text(InferenceClient(token=settings.hf_token), prompt, mode, history)
     except Exception as error:
@@ -785,12 +771,18 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
         else:
             if mode == Mode.SEARCH:
                 if not settings.gemini_api_key:
-                    raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
-                try:
-                    answer = await gemini_search(settings, message.text)
-                except Exception:
-                    logging.warning("Search failed; using regular smart answer", exc_info=True)
                     answer = await answer_smart_text(settings, message.text, history)
+                try:
+                    if settings.gemini_api_key:
+                        answer = await gemini_search(settings, message.text)
+                except Exception:
+                    logging.warning("Search failed; using DeepSeek fallback", exc_info=True)
+                    answer = await hf_text(
+                        InferenceClient(token=settings.hf_token),
+                        message.text,
+                        Mode.CHAT,
+                        history,
+                    )
             elif choose_text_backend(settings, mode, message.text) == "gemini":
                 try:
                     answer = await gemini_text(settings, message.text, mode, history)
@@ -873,14 +865,7 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
                 "если нужна актуальная цена или ссылка, укажи, что для этого нужен "
                 "поиск в интернете.\n\nВопрос: " + question
             )
-            if settings.gemini_api_key:
-                try:
-                    answer = await gemini_vision_answer(settings, content, vision_prompt)
-                except Exception:
-                    logging.warning("Gemini smart photo failed; using DeepSeek vision", exc_info=True)
-                    answer = await hf_vision_answer(client, content, vision_prompt)
-            else:
-                answer = await hf_vision_answer(client, content, vision_prompt)
+            answer = await hf_vision_answer(client, content, vision_prompt)
             await asyncio.to_thread(
                 save_history,
                 message.from_user.id,
@@ -1041,9 +1026,7 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
                 f"\n\nДокумент:\n{extracted}"
             )
             selected_mode = smart_mode(message.caption or "") if mode == Mode.CHAT else Mode.CHAT
-            answer = await gemini_text(
-                settings, document_prompt, selected_mode, history
-            ) if settings.gemini_api_key else await hf_text(
+            answer = await hf_text(
                 InferenceClient(token=settings.hf_token),
                 document_prompt, selected_mode, history
             )
