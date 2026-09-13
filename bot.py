@@ -104,14 +104,14 @@ def back_menu() -> InlineKeyboardMarkup:
 
 ABOUT_TEXT = (
     "✨ <b>Elyra</b> — твой AI-помощник в Telegram.\n\n"
-    "🧠 <b>Умный чат</b> — вопросы и объяснения\n"
+    "🧠 <b>Умный чат</b> — сам выбирает модель, интернет, код и анализ файлов\n"
     "💻 <b>Решить код</b> — программирование\n"
     "🤖 <b>Агент</b> — планы и сложные задачи\n"
     "📷 <b>Решить фото</b> — условие с картинки + решение\n"
     "🌐 <b>Поиск в интернете</b> — актуальные сведения через Gemini\n"
     "🎨 <b>Создать картинку</b> — генерация\n"
     "✏️ <b>Изменить фото</b> — редактирование\n\n"
-    "Выберите нужный режим — я помогу разобраться быстро и понятно.\n"
+    "В умном чате можно отправить вопрос, голос, фото или файл — я сам выберу способ обработки.\n"
     "🆘 Поддержка: @Makeiew"
 )
 
@@ -218,6 +218,31 @@ def choose_text_backend(settings: Settings, mode: Mode, prompt: str) -> str:
     if settings.gemini_api_key and len(prompt) > 1200:
         return "gemini"
     return "gemini" if settings.gemini_api_key else "deepseek"
+
+
+def smart_mode(prompt: str) -> Mode:
+    lowered = prompt.lower()
+    search_words = (
+        "сегодня", "завтра", "сейчас", "актуаль", "новост", "погода",
+        "цена", "стоимость", "курс", "найди", "найти", "ссылка", "интернет",
+        "latest", "today", "tomorrow", "weather", "price", "search",
+    )
+    code_words = (
+        "код", "программ", "python", "javascript", "typescript", "java",
+        "c++", "ошибк", "функци", "скрипт", "api", "sql", "html", "css",
+        "code", "bug", "function",
+    )
+    agent_words = (
+        "составь план", "пошагово", "организуй", "спланируй", "разбей задачу",
+        "агент", "исследуй", "проанализируй варианты", "что делать дальше",
+    )
+    if any(word in lowered for word in search_words):
+        return Mode.SEARCH
+    if any(word in lowered for word in code_words):
+        return Mode.CODE
+    if any(word in lowered for word in agent_words):
+        return Mode.AGENT
+    return Mode.CHAT
 
 
 async def gemini_text(
@@ -697,21 +722,28 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
     status = await thinking(message)
     try:
         history = await asyncio.to_thread(load_history, message.from_user.id)
-        if mode == Mode.SEARCH:
+        selected_mode = smart_mode(message.text) if mode == Mode.CHAT else mode
+        if selected_mode == Mode.SEARCH:
             if not settings.gemini_api_key:
                 raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
             answer = await gemini_search(settings, message.text)
-        elif choose_text_backend(settings, mode, message.text) == "gemini":
+        elif choose_text_backend(settings, selected_mode, message.text) == "gemini":
             try:
-                answer = await gemini_text(settings, message.text, mode, history)
+                answer = await gemini_text(settings, message.text, selected_mode, history)
             except Exception:
                 logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
                 answer = await hf_text(
-                    InferenceClient(token=settings.hf_token), message.text, mode, history
+                    InferenceClient(token=settings.hf_token),
+                    message.text,
+                    selected_mode,
+                    history,
                 )
         else:
             answer = await hf_text(
-                InferenceClient(token=settings.hf_token), message.text, mode, history
+                InferenceClient(token=settings.hf_token),
+                message.text,
+                selected_mode,
+                history,
             )
         await asyncio.to_thread(save_history, message.from_user.id, "user", message.text)
         await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
@@ -741,32 +773,38 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
         mime_type = "audio/ogg" if message.voice else (media.mime_type or "audio/mpeg")
         try:
             prompt = await asyncio.wait_for(
-                gemini_transcribe(settings, content, mime_type),
+                hf_transcribe(InferenceClient(token=settings.hf_token), content),
                 timeout=90,
             )
         except Exception:
-            logging.warning("Gemini transcription failed; using Whisper fallback", exc_info=True)
+            logging.warning("Whisper transcription failed; using Gemini fallback", exc_info=True)
             prompt = await asyncio.wait_for(
-                hf_transcribe(InferenceClient(token=settings.hf_token), content),
+                gemini_transcribe(settings, content, mime_type),
                 timeout=90,
             )
         if not prompt:
             raise RuntimeError("Расшифровка голосового сообщения пуста.")
         history = await asyncio.to_thread(load_history, message.from_user.id)
-        try:
+        selected_mode = smart_mode(prompt)
+        if selected_mode == Mode.SEARCH:
+            if not settings.gemini_api_key:
+                raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
+            answer = await asyncio.wait_for(gemini_search(settings, prompt), timeout=90)
+        elif choose_text_backend(settings, selected_mode, prompt) == "gemini":
+            try:
+                answer = await asyncio.wait_for(
+                    gemini_text(settings, prompt, selected_mode, history),
+                    timeout=90,
+                )
+            except Exception:
+                logging.warning("Gemini voice answer failed; falling back to DeepSeek", exc_info=True)
+                answer = await asyncio.wait_for(
+                    hf_text(InferenceClient(token=settings.hf_token), prompt, selected_mode, history),
+                    timeout=90,
+                )
+        else:
             answer = await asyncio.wait_for(
-                gemini_text(settings, prompt, Mode.CHAT, history),
-                timeout=90,
-            )
-        except Exception:
-            logging.warning("Gemini voice answer failed; falling back to DeepSeek", exc_info=True)
-            answer = await asyncio.wait_for(
-                hf_text(
-                    InferenceClient(token=settings.hf_token),
-                    prompt,
-                    Mode.CHAT,
-                    history,
-                ),
+                hf_text(InferenceClient(token=settings.hf_token), prompt, selected_mode, history),
                 timeout=90,
             )
         await asyncio.to_thread(save_history, message.from_user.id, "user", "[Голос]\n" + prompt)
@@ -789,6 +827,30 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
         buffer = await bot.download_file(file.file_path)
         content = buffer.read()
         client = InferenceClient(token=settings.hf_token)
+        if mode == Mode.CHAT:
+            question = (message.caption or "Проанализируй изображение и объясни, что на нем изображено.").strip()
+            vision_prompt = (
+                "Ответь на вопрос пользователя по изображению. Не выдумывай факты; "
+                "если нужна актуальная цена или ссылка, укажи, что для этого нужен "
+                "поиск в интернете.\n\nВопрос: " + question
+            )
+            if settings.gemini_api_key:
+                try:
+                    answer = await gemini_vision_answer(settings, content, vision_prompt)
+                except Exception:
+                    logging.warning("Gemini smart photo failed; using DeepSeek vision", exc_info=True)
+                    answer = await hf_vision_answer(client, content, vision_prompt)
+            else:
+                answer = await hf_vision_answer(client, content, vision_prompt)
+            await asyncio.to_thread(
+                save_history,
+                message.from_user.id,
+                "user",
+                f"[Умный чат: изображение]\n{question}",
+            )
+            await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
+            await send_answer(message, answer)
+            return
         if settings.gemini_api_key:
             try:
                 extracted = await gemini_vision_answer(
@@ -909,7 +971,8 @@ async def image_question_photo(
 @router.message(UserFlow.waiting_for_prompt, F.document)
 async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
-    if data.get("mode") != Mode.OCR.value:
+    mode = Mode(data["mode"])
+    if mode not in (Mode.OCR, Mode.CHAT):
         await message.answer("В этом режиме нужен текстовый запрос.", reply_markup=back_menu())
         return
     status = await thinking(message)
@@ -924,20 +987,34 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
                 raise RuntimeError("Анализ PDF требует GEMINI_API_KEY.")
             answer = await gemini_document_answer(
                 settings, content, "application/pdf",
-                "Извлеки текст из PDF и кратко объясни его содержание.",
+                "Извлеки текст из PDF и ответь на запрос пользователя. "
+                "Если запрос не указан, кратко объясни содержание. "
+                f"Запрос: {message.caption or 'кратко объясни содержание документа'}",
             )
         else:
             extracted = await extract_document_text(content, name, mime)
             if not extracted.strip():
                 raise RuntimeError("В документе не найден текст.")
             history = await asyncio.to_thread(load_history, message.from_user.id)
+            document_prompt = (
+                "Проанализируй документ и ответь на запрос пользователя. "
+                f"Запрос: {message.caption or 'сделай краткое содержание и выдели главное'}"
+                f"\n\nДокумент:\n{extracted}"
+            )
+            selected_mode = smart_mode(message.caption or "") if mode == Mode.CHAT else Mode.CHAT
             answer = await gemini_text(
-                settings, "Проанализируй документ:\n\n" + extracted,
-                Mode.CHAT, history
+                settings, document_prompt, selected_mode, history
             ) if settings.gemini_api_key else await hf_text(
                 InferenceClient(token=settings.hf_token),
-                "Проанализируй документ:\n\n" + extracted, Mode.CHAT, history
+                document_prompt, selected_mode, history
             )
+        await asyncio.to_thread(
+            save_history,
+            message.from_user.id,
+            "user",
+            f"[Документ: {name}] {message.caption or ''}",
+        )
+        await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer or "")
         await send_answer(message, answer or "Текст не найден.")
     except Exception as error:
         await send_error(message, error)
