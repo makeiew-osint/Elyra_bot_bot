@@ -815,40 +815,11 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
 
 @router.message(F.content_type.in_({"voice", "audio"}))
 async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
-    status = await thinking(message)
-    try:
-        media = message.voice if message.content_type == "voice" else message.audio
-        if media is None:
-            raise RuntimeError("Голосовое сообщение не содержит аудиофайл.")
-        file = await bot.get_file(media.file_id)
-        buffer = await bot.download_file(file.file_path)
-        content = buffer.read()
-        try:
-            prompt = await asyncio.wait_for(
-                hf_transcribe(InferenceClient(token=settings.hf_token), content),
-                timeout=90,
-            )
-        except Exception as error:
-            logging.warning("Whisper transcription failed", exc_info=True)
-            raise RuntimeError(
-                "Не удалось расшифровать голос через Whisper. "
-                "Проверьте HF_TOKEN и доступность модели Whisper."
-            ) from error
-        if not prompt:
-            raise RuntimeError("Расшифровка голосового сообщения пуста.")
-        history = await asyncio.to_thread(load_history, message.from_user.id)
-        answer = await asyncio.wait_for(
-            answer_smart_text(settings, prompt, history),
-            timeout=120,
-        )
-        await asyncio.to_thread(save_history, message.from_user.id, "user", "[Голос]\n" + prompt)
-        await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
-        await message.answer(f"📝 <b>Расшифровка:</b>\n{html.escape(prompt)}", parse_mode="HTML")
-        await send_answer(message, answer)
-    except Exception as error:
-        await send_error(message, error)
-    finally:
-        await clear_thinking(status)
+    await message.answer(
+        "🎙️ Голосовые сообщения временно недоступны.\n\n"
+        "Пожалуйста, отправьте запрос текстом или воспользуйтесь другим режимом.",
+        reply_markup=back_menu(),
+    )
 
 
 @router.message(UserFlow.waiting_for_prompt, F.photo)
