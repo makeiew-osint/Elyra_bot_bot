@@ -6,12 +6,15 @@ import logging
 import re
 import sqlite3
 import tempfile
+import json
+import time
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -39,11 +42,19 @@ from config import (
     TEXT_MODEL,
     Settings,
 )
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:
+    ConnectionPool = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 router = Router()
 HISTORY_DB = Path(__file__).with_name("elyra_history.sqlite3")
 CONTEXT_MESSAGES = 24
+DB_POOL = None
+DB_SETTINGS = None
+BOT_INSTANCE = None
+HEALTH_STATE = {"last": 0.0, "api_errors": 0, "provider_errors": 0, "maintenance": False}
 
 
 class Mode(str, Enum):
@@ -81,6 +92,7 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history:clear"),
+                InlineKeyboardButton(text="💬 Чаты", callback_data="chats:list"),
             ],
             [
                 InlineKeyboardButton(text="ℹ️ О боте", callback_data="about"),
@@ -111,7 +123,7 @@ ABOUT_TEXT = (
     "🌐 <b>Поиск в интернете</b> — актуальные сведения через Gemini\n"
     "🎨 <b>Создать картинку</b> — генерация\n"
     "✏️ <b>Изменить фото</b> — редактирование\n\n"
-    "В умном чате можно отправить вопрос, голос, фото или файл — я сам выберу способ обработки.\n"
+    "В умном чате можно отправить вопрос, фото или файл — я сам выберу способ обработки.\n"
     "🆘 Поддержка: @Makeiew"
 )
 
@@ -128,47 +140,146 @@ def prompt_for_mode(mode: Mode) -> str:
     }[mode]
 
 
-def init_history() -> None:
+def init_history(settings=None) -> None:
+    """Use PostgreSQL in production and SQLite only when DATABASE_URL is absent."""
+    global DB_POOL, DB_SETTINGS
+    DB_SETTINGS = settings
+    if settings and settings.database_url:
+        if ConnectionPool is None:
+            raise RuntimeError("DATABASE_URL задан, но psycopg-pool не установлен.")
+        DB_POOL = ConnectionPool(settings.database_url, min_size=1, max_size=5, open=True)
+        with DB_POOL.connection() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS chats (
+                id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now())""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS conversation_history (
+                id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, chat_id INTEGER,
+                role TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS usage (
+                user_id BIGINT NOT NULL, usage_date DATE NOT NULL, messages INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, usage_date))""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+        return
     with sqlite3.connect(HISTORY_DB) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS conversation_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        connection.commit()
+        connection.executescript("""CREATE TABLE IF NOT EXISTS chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, chat_id INTEGER,
+            role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS usage (
+            user_id INTEGER NOT NULL, usage_date TEXT NOT NULL, messages INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id, usage_date));""")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(conversation_history)")}
+        if "chat_id" not in columns:
+            connection.execute("ALTER TABLE conversation_history ADD COLUMN chat_id INTEGER")
+            users = [row[0] for row in connection.execute("SELECT DISTINCT user_id FROM conversation_history WHERE user_id NOT IN (SELECT user_id FROM chats)")]
+            for user_id in users:
+                connection.execute("INSERT INTO chats(user_id,name,active) VALUES(?,?,1)", (user_id, "История"))
+            connection.execute("UPDATE conversation_history SET chat_id = (SELECT id FROM chats WHERE chats.user_id = conversation_history.user_id AND chats.active=1 LIMIT 1)")
 
+def _db():
+    if DB_POOL:
+        return DB_POOL.connection()
+    return sqlite3.connect(HISTORY_DB)
+
+def _placeholder():
+    return "%s" if DB_POOL else "?"
+
+def _ensure_chat(user_id):
+    p = _placeholder()
+    with _db() as connection:
+        row = connection.execute(f"SELECT id FROM chats WHERE user_id={p} AND active=1 ORDER BY id LIMIT 1", (user_id,)).fetchone()
+        if row:
+            return row[0]
+        if DB_POOL:
+            row = connection.execute(f"INSERT INTO chats(user_id,name,active) VALUES({p},{p},1) RETURNING id", (user_id, "Новый чат")).fetchone()
+            return row[0]
+        cursor = connection.execute("INSERT INTO chats(user_id,name,active) VALUES(?,?,1)", (user_id, "Новый чат"))
+        return cursor.lastrowid
 
 def load_history(user_id: int) -> list[tuple[str, str]]:
-    with sqlite3.connect(HISTORY_DB) as connection:
-        rows = connection.execute(
-            """
-            SELECT role, content FROM conversation_history
-            WHERE user_id = ? ORDER BY id DESC LIMIT ?
-            """,
-            (user_id, CONTEXT_MESSAGES),
-        ).fetchall()
+    chat_id = _ensure_chat(user_id)
+    p = _placeholder()
+    with _db() as connection:
+        rows = connection.execute(f"SELECT role, content FROM conversation_history WHERE user_id={p} AND chat_id={p} ORDER BY id DESC LIMIT {p}", (user_id, chat_id, CONTEXT_MESSAGES)).fetchall()
     return list(reversed(rows))
 
 
 def save_history(user_id: int, role: str, content: str) -> None:
-    with sqlite3.connect(HISTORY_DB) as connection:
-        connection.execute(
-            "INSERT INTO conversation_history (user_id, role, content) VALUES (?, ?, ?)",
-            (user_id, role, content),
-        )
-        connection.commit()
+    chat_id = _ensure_chat(user_id)
+    p = _placeholder()
+    with _db() as connection:
+        connection.execute(f"INSERT INTO conversation_history (user_id,chat_id,role,content) VALUES ({p},{p},{p},{p})", (user_id, chat_id, role, content))
 
 
 def clear_history(user_id: int) -> None:
-    with sqlite3.connect(HISTORY_DB) as connection:
-        connection.execute("DELETE FROM conversation_history WHERE user_id = ?", (user_id,))
-        connection.commit()
+    p = _placeholder()
+    with _db() as connection:
+        connection.execute(f"DELETE FROM conversation_history WHERE user_id={p}", (user_id,))
+
+def consume_limit(user_id: int, limit: int) -> bool:
+    if limit <= 0:
+        return True
+    today = datetime.now(timezone.utc).date().isoformat()
+    p = _placeholder()
+    with _db() as connection:
+        row = connection.execute(f"SELECT messages FROM usage WHERE user_id={p} AND usage_date={p}", (user_id, today)).fetchone()
+        count = row[0] if row else 0
+        if count >= limit:
+            return False
+        if row:
+            connection.execute(f"UPDATE usage SET messages=messages+1 WHERE user_id={p} AND usage_date={p}", (user_id, today))
+        else:
+            connection.execute(f"INSERT INTO usage(user_id,usage_date,messages) VALUES({p},{p},1)", (user_id, today))
+    return True
+
+
+async def ai_request_allowed(message: Message, settings: Settings) -> bool:
+    """Apply the daily AI quota consistently; configured administrators bypass it."""
+    if is_admin(message.from_user.id, settings):
+        return True
+    allowed = await asyncio.to_thread(
+        consume_limit, message.from_user.id, settings.daily_message_limit
+    )
+    if not allowed:
+        await message.answer(
+            "⏳ Дневной лимит сообщений исчерпан. Попробуйте завтра (UTC).",
+            reply_markup=back_menu(),
+        )
+    return allowed
+
+def chat_action(user_id: int, action: str, name: str = "") -> str:
+        p = _placeholder()
+        with _db() as connection:
+            if action == "new":
+                if DB_POOL:
+                    row = connection.execute(f"INSERT INTO chats(user_id,name,active) VALUES({p},{p},1) RETURNING id", (user_id, name or "Новый чат")).fetchone()
+                    connection.execute(f"UPDATE chats SET active=0 WHERE user_id={p} AND id<>{p}", (user_id, row[0]))
+                else:
+                    connection.execute("UPDATE chats SET active=0 WHERE user_id=?", (user_id,))
+                    row = connection.execute("INSERT INTO chats(user_id,name,active) VALUES(?,?,1)", (user_id, name or "Новый чат"))
+                return str(row[0] if DB_POOL else row.lastrowid)
+            if action == "rename":
+                connection.execute(f"UPDATE chats SET name={p} WHERE user_id={p} AND active=1", (name or "Чат", user_id))
+            elif action == "delete":
+                connection.execute(f"DELETE FROM chats WHERE user_id={p} AND active=1", (user_id,))
+            elif action == "switch":
+                try:
+                    chat_id = int(name)
+                except (TypeError, ValueError):
+                    return ""
+                connection.execute(f"UPDATE chats SET active=0 WHERE user_id={p}", (user_id,))
+                connection.execute(f"UPDATE chats SET active=1 WHERE user_id={p} AND id={p}", (user_id, chat_id))
+            elif action == "list":
+                return "\n".join(f"{row[0]}. {row[1]}{' ✅' if row[2] else ''}" for row in connection.execute(f"SELECT id,name,active FROM chats WHERE user_id={p} ORDER BY id", (user_id,)).fetchall())
+        return ""
+
+def admin_stats() -> str:
+    with _db() as connection:
+        users = connection.execute("SELECT COUNT(DISTINCT user_id) FROM chats").fetchone()[0]
+        messages = connection.execute("SELECT COUNT(*) FROM conversation_history").fetchone()[0]
+    return f"👥 Пользователей: {users}\n💬 Сообщений: {messages}\n🛠 Техработы: {'включены' if HEALTH_STATE['maintenance'] else 'выключены'}"
 
 
 def history_prompt(history: list[tuple[str, str]], prompt: str) -> str:
@@ -527,8 +638,37 @@ async def extract_document_text(content: bytes, name: str, mime: str) -> str:
         return "\n".join(rows)[:120000]
     raise RuntimeError("Поддерживаются PDF, DOCX, TXT и XLSX.")
 
+def document_chunks(text: str, size: int = 12000) -> list[str]:
+    return [text[index:index + size] for index in range(0, len(text), size)] or [""]
+
+def is_admin(user_id: int, settings: Settings) -> bool:
+    return user_id in settings.admin_user_ids
+
+def export_history(user_id: int, fmt: str) -> tuple[bytes, str, str]:
+    rows = load_history(user_id)
+    if fmt == "json":
+        return json.dumps([{"role": r, "content": c} for r, c in rows], ensure_ascii=False, indent=2).encode(), "history.json", "application/json"
+    return "\n\n".join(f"{role.upper()}:\n{content}" for role, content in rows).encode("utf-8"), "history.txt", "text/plain"
+
+def _health_message(event: str) -> str:
+    return f"⚠️ Elyra health: {event}\nВремя UTC: {datetime.now(timezone.utc).isoformat()}"
+
+async def notify_admins(bot: Bot, settings: Settings, event: str) -> None:
+    now = time.monotonic()
+    if now - HEALTH_STATE["last"] < settings.healthcheck_interval_minutes * 60:
+        return
+    HEALTH_STATE["last"] = now
+    for admin_id in settings.admin_user_ids:
+        try:
+            await bot.send_message(admin_id, _health_message(event))
+        except TelegramAPIError:
+            logging.warning("Could not notify admin %s", admin_id)
+
 
 async def send_error(message: Message, error: Exception) -> None:
+    if BOT_INSTANCE and DB_SETTINGS:
+        HEALTH_STATE["provider_errors"] += 1
+        await notify_admins(BOT_INSTANCE, DB_SETTINGS, f"ошибка провайдера/API: {type(error).__name__}")
     logging.exception("Hugging Face request failed", exc_info=error)
     error_text = str(error)
     if is_hf_error(error) and not is_gemini_quota_error(error):
@@ -668,11 +808,123 @@ async def start(message: Message, state: FSMContext) -> None:
         "👇 Выбери нужный режим:",
     )
 
+@router.message(Command("newchat"))
+async def new_chat(message: Message, command: CommandObject) -> None:
+    chat_action(message.from_user.id, "new", command.args if command else "")
+    await message.answer("✅ Создан и выбран новый чат.", reply_markup=main_menu())
+
+@router.message(Command("chats"))
+async def chats_command(message: Message) -> None:
+    await message.answer("💬 Ваши чаты:\n" + (chat_action(message.from_user.id, "list") or "Чатов пока нет.") +
+                         "\n\n/newchat [название] — новый\n/renamechat [название] — переименовать\n/deletechat — удалить активный\n/export txt|json — экспорт")
+
+@router.message(Command("renamechat"))
+async def rename_chat(message: Message, command: CommandObject) -> None:
+    chat_action(message.from_user.id, "rename", command.args if command else "")
+    await message.answer("✅ Активный чат переименован.")
+
+@router.message(Command("deletechat"))
+async def delete_chat(message: Message) -> None:
+    chat_action(message.from_user.id, "delete")
+    await message.answer("✅ Активный чат удалён.")
+
+@router.message(Command("switchchat"))
+async def switch_chat(message: Message, command: CommandObject) -> None:
+    chat_action(message.from_user.id, "switch", command.args if command else "")
+    await message.answer("✅ Активный чат переключён.", reply_markup=main_menu())
+
+@router.message(Command("export"))
+async def export_command(message: Message, command: CommandObject) -> None:
+    fmt = (command.args or "txt").lower() if command else "txt"
+    if fmt not in ("txt", "json"):
+        await message.answer("Используйте /export txt или /export json")
+        return
+    data, filename, _ = export_history(message.from_user.id, fmt)
+    await message.answer_document(BufferedInputFile(data, filename=filename), caption="📦 Экспорт истории")
+
+@router.callback_query(F.data == "chats:list")
+async def chats_callback(callback: CallbackQuery) -> None:
+    await callback.message.answer("💬 Ваши чаты:\n" + (chat_action(callback.from_user.id, "list") or "Чатов пока нет.") +
+                                  "\n/newchat [название]\n/renamechat [название]\n/deletechat\n/export txt|json")
+    await callback.answer()
+
+@router.message(Command("stats"))
+async def stats_command(message: Message, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await message.answer("Недостаточно прав.")
+        return
+    await message.answer(admin_stats())
+
+@router.message(Command("admin"))
+async def admin_command(message: Message, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await message.answer("Недостаточно прав.")
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
+         InlineKeyboardButton(text="🛠 Техработы", callback_data="admin:maintenance")],
+        [InlineKeyboardButton(text="❤️ Health", callback_data="admin:health")],
+    ])
+    await message.answer("🔐 Панель администратора", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("admin:"))
+async def admin_callback(callback: CallbackQuery, settings: Settings) -> None:
+    if not is_admin(callback.from_user.id, settings):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    action = callback.data.split(":", 1)[1]
+    if action == "stats":
+        await callback.message.answer(admin_stats())
+    elif action == "health":
+        await callback.message.answer(f"✅ API process online\nProvider errors: {HEALTH_STATE['provider_errors']}")
+    else:
+        HEALTH_STATE["maintenance"] = not HEALTH_STATE["maintenance"]
+        await callback.message.answer("🛠 Техработы " + ("включены." if HEALTH_STATE["maintenance"] else "выключены."))
+    await callback.answer()
+
+@router.message(Command("health"))
+async def health_command(message: Message, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await message.answer("Недостаточно прав.")
+        return
+    await message.answer(f"✅ API process online\nProvider errors: {HEALTH_STATE['provider_errors']}\n{admin_stats()}")
+
+@router.message(Command("maintenance"))
+async def maintenance_command(message: Message, command: CommandObject, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await message.answer("Недостаточно прав.")
+        return
+    value = (command.args or "").lower() if command else ""
+    HEALTH_STATE["maintenance"] = value in ("on", "1", "вкл")
+    await message.answer("🛠 Техработы " + ("включены." if HEALTH_STATE["maintenance"] else "выключены."))
+
+@router.message(Command("broadcast"))
+async def broadcast_command(message: Message, command: CommandObject, settings: Settings, bot: Bot) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await message.answer("Недостаточно прав.")
+        return
+    text = command.args if command else ""
+    if not text:
+        await message.answer("Использование: /broadcast текст")
+        return
+    p = _placeholder()
+    with _db() as connection:
+        users = {row[0] for row in connection.execute(f"SELECT DISTINCT user_id FROM chats")}
+    sent = 0
+    for user_id in users:
+        try:
+            await bot.send_message(user_id, text)
+            sent += 1
+        except TelegramAPIError:
+            pass
+    await message.answer(f"📣 Отправлено: {sent}")
+
 
 @router.message(Command("help"))
 async def help_command(message: Message) -> None:
     await message.answer(
-        "Выберите режим в меню и отправьте запрос. Можно отправить голос, фото, PDF, DOCX, TXT или XLSX.\n"
+        "Выберите режим в меню и отправьте запрос. Голосовые сообщения отключены; "
+        "доступны фото, PDF, DOCX, TXT или XLSX.\n"
         "Команда /cancel сбрасывает текущий режим.",
         reply_markup=main_menu(),
     )
@@ -767,10 +1019,15 @@ async def mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(UserFlow.waiting_for_prompt, F.text)
 async def text_request(message: Message, state: FSMContext, settings: Settings) -> None:
+    if HEALTH_STATE["maintenance"] and not is_admin(message.from_user.id, settings):
+        await message.answer("🛠 Бот временно на техническом обслуживании. Попробуйте позже.", reply_markup=back_menu())
+        return
     data = await state.get_data()
     mode = Mode(data["mode"])
     if mode == Mode.OCR:
         await message.answer("Для OCR отправьте изображение или PDF.", reply_markup=back_menu())
+        return
+    if not await ai_request_allowed(message, settings):
         return
     status = await thinking(message)
     try:
@@ -824,6 +1081,8 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
 
 @router.message(UserFlow.waiting_for_prompt, F.photo)
 async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Settings) -> None:
+    if not await ai_request_allowed(message, settings):
+        return
     data = await state.get_data()
     status = await thinking(message)
     try:
@@ -968,6 +1227,8 @@ async def image_question_photo(
 
 @router.message(UserFlow.waiting_for_prompt, F.document)
 async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: Settings) -> None:
+    if not await ai_request_allowed(message, settings):
+        return
     data = await state.get_data()
     mode = Mode(data["mode"])
     if mode not in (Mode.OCR, Mode.CHAT):
@@ -978,6 +1239,8 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
         file = await bot.get_file(message.document.file_id)
         buffer = await bot.download_file(file.file_path)
         content = buffer.read()
+        if len(content) > settings.max_file_size_mb * 1024 * 1024:
+            raise RuntimeError(f"Файл слишком большой. Максимальный размер: {settings.max_file_size_mb} МБ.")
         name = (message.document.file_name or "").lower()
         mime = message.document.mime_type or ""
         if mime == "application/pdf" or name.endswith(".pdf"):
@@ -1000,10 +1263,14 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
                 f"\n\nДокумент:\n{extracted}"
             )
             selected_mode = smart_mode(message.caption or "") if mode == Mode.CHAT else Mode.CHAT
-            answer = await hf_text(
-                InferenceClient(token=settings.hf_token),
-                document_prompt, selected_mode, history
-            )
+            answers = []
+            for chunk in document_chunks(extracted):
+                answers.append(await hf_text(
+                    InferenceClient(token=settings.hf_token),
+                    document_prompt + f"\n\nЧасть документа:\n{chunk}",
+                    selected_mode, history
+                ))
+            answer = "\n\n".join(answers)
         await asyncio.to_thread(
             save_history,
             message.from_user.id,
@@ -1020,6 +1287,8 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
 
 @router.message(UserFlow.waiting_for_image_prompt, F.text)
 async def image_request(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not await ai_request_allowed(message, settings):
+        return
     status = await thinking(message)
     try:
         client = InferenceClient(token=settings.hf_token)
@@ -1074,6 +1343,8 @@ async def edit_image_expected(message: Message) -> None:
 async def edit_request(
     message: Message, bot: Bot, state: FSMContext, settings: Settings
 ) -> None:
+    if not await ai_request_allowed(message, settings):
+        return
     await message.answer(
         "Запрос на редактирование принят, обрабатываю изображение…"
     )
@@ -1093,8 +1364,10 @@ async def edit_request(
 
 async def main() -> None:
     settings = Settings.from_env()
-    init_history()
+    init_history(settings)
     bot = Bot(settings.telegram_token)
+    global BOT_INSTANCE
+    BOT_INSTANCE = bot
     try:
         await bot.set_my_commands(
             [
@@ -1103,6 +1376,11 @@ async def main() -> None:
                 BotCommand(command="about", description="О боте"),
                 BotCommand(command="cancel", description="Отменить режим"),
                 BotCommand(command="clearhistory", description="Очистить историю"),
+                BotCommand(command="chats", description="Мои чаты"),
+                BotCommand(command="newchat", description="Новый чат"),
+                BotCommand(command="export", description="Экспорт истории"),
+                BotCommand(command="health", description="Состояние сервиса"),
+                BotCommand(command="stats", description="Статистика (админ)"),
             ]
         )
     except TelegramAPIError:
@@ -1110,8 +1388,14 @@ async def main() -> None:
     dp = Dispatcher()
     dp["settings"] = settings
     dp.include_router(router)
+    await notify_admins(bot, settings, "бот запущен")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except Exception as error:
+        HEALTH_STATE["api_errors"] += 1
+        await notify_admins(bot, settings, f"падение API/polling: {type(error).__name__}")
+        raise
 
 
 if __name__ == "__main__":
