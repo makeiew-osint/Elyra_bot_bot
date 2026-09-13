@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -334,9 +334,7 @@ def format_answer(text: str) -> str:
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
         escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", escaped)
         escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-        escaped = re.sub(r"^#{1,6}\s+", "<b>", escaped)
-        if escaped.startswith("<b>") and not escaped.endswith("</b>"):
-            escaped += "</b>"
+        escaped = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", escaped)
         output.append(escaped)
         index += 1
     if in_code:
@@ -351,7 +349,11 @@ async def send_answer(message: Message, answer: str) -> None:
     if len(formatted) > 4000:
         await message.answer(clean_answer[:3900], reply_markup=back_menu())
     else:
-        await message.answer(formatted, reply_markup=back_menu(), parse_mode="HTML")
+        try:
+            await message.answer(formatted, reply_markup=back_menu(), parse_mode="HTML")
+        except TelegramBadRequest:
+            logging.warning("Telegram rejected formatted answer; sending plain text", exc_info=True)
+            await message.answer(clean_answer[:4000], reply_markup=back_menu())
     document = BufferedInputFile(clean_answer.encode("utf-8"), filename="elyra_answer.txt")
     await message.answer_document(document, caption="📄 Полный ответ в TXT")
 
