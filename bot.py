@@ -712,6 +712,61 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
         await clear_thinking(status)
 
 
+@router.message(UserFlow.waiting_for_image_prompt, F.photo)
+async def image_question_photo(
+    message: Message, bot: Bot, state: FSMContext, settings: Settings
+) -> None:
+    """Treat a photo with a caption as a vision question, not image generation."""
+    question = (message.caption or "").strip()
+    if not question:
+        await message.answer(
+            "Напишите вопрос подписью к фотографии, например: "
+            "«Что это и сколько примерно стоит?»",
+            reply_markup=back_menu(),
+        )
+        return
+
+    status = await thinking(message)
+    try:
+        file = await bot.get_file(message.photo[-1].file_id)
+        buffer = await bot.download_file(file.file_path)
+        content = buffer.read()
+        prompt = (
+            "Ответь на вопрос пользователя по фотографии. "
+            "Внимательно опиши, что видно на изображении. Если спрашивают цену, "
+            "не выдумывай точную стоимость: укажи ориентировочный диапазон, "
+            "от чего он зависит, и какие данные нужны для точной оценки. "
+            "Если просят ссылку на магазин, честно скажи, что не можешь проверить "
+            "актуальные цены без поиска в интернете.\n\n"
+            f"Вопрос пользователя: {question}"
+        )
+        if settings.gemini_api_key:
+            try:
+                answer = await gemini_vision_answer(settings, content, prompt)
+            except Exception:
+                logging.warning("Gemini vision failed; using DeepSeek vision", exc_info=True)
+                answer = await hf_vision_answer(
+                    InferenceClient(token=settings.hf_token), content, prompt
+                )
+        else:
+            answer = await hf_vision_answer(
+                InferenceClient(token=settings.hf_token), content, prompt
+            )
+        await asyncio.to_thread(
+            save_history,
+            message.from_user.id,
+            "user",
+            f"[Вопрос по изображению]\n{question}",
+        )
+        await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
+        await send_answer(message, answer)
+        await state.set_state(UserFlow.waiting_for_image_prompt)
+    except Exception as error:
+        await send_error(message, error)
+    finally:
+        await clear_thinking(status)
+
+
 @router.message(UserFlow.waiting_for_prompt, F.document)
 async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
