@@ -188,7 +188,7 @@ async def help_command(message: Message) -> None:
 
 @router.message(Command("about"))
 async def about_command(message: Message) -> None:
-    await message.answer(ABOUT_TEXT, reply_markup=main_menu())
+    await message.answer(ABOUT_TEXT, reply_markup=main_menu(), parse_mode="HTML")
 
 
 @router.message(Command("cancel"))
