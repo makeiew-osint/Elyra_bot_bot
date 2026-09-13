@@ -5,3 +5,4 @@ __pycache__/
 downloads/
 outputs/
 *.log
+elyra_history.sqlite3

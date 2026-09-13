@@ -4,6 +4,7 @@ import html
 import io
 import logging
 import re
+import sqlite3
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -39,6 +40,8 @@ from config import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 router = Router()
+HISTORY_DB = Path(__file__).with_name("elyra_history.sqlite3")
+CONTEXT_MESSAGES = 24
 
 
 class Mode(str, Enum):
@@ -71,6 +74,9 @@ def main_menu() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🎨 Создать картинку", callback_data="mode:image"),
                 InlineKeyboardButton(text="✏️ Изменить фото", callback_data="mode:edit"),
+            ],
+            [
+                InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history:clear"),
             ],
             [
                 InlineKeyboardButton(text="ℹ️ О боте", callback_data="about"),
@@ -116,7 +122,62 @@ def prompt_for_mode(mode: Mode) -> str:
     }[mode]
 
 
-async def hf_text(client: InferenceClient, prompt: str, mode: Mode) -> str:
+def init_history() -> None:
+    with sqlite3.connect(HISTORY_DB) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.commit()
+
+
+def load_history(user_id: int) -> list[tuple[str, str]]:
+    with sqlite3.connect(HISTORY_DB) as connection:
+        rows = connection.execute(
+            """
+            SELECT role, content FROM conversation_history
+            WHERE user_id = ? ORDER BY id DESC LIMIT ?
+            """,
+            (user_id, CONTEXT_MESSAGES),
+        ).fetchall()
+    return list(reversed(rows))
+
+
+def save_history(user_id: int, role: str, content: str) -> None:
+    with sqlite3.connect(HISTORY_DB) as connection:
+        connection.execute(
+            "INSERT INTO conversation_history (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, role, content),
+        )
+        connection.commit()
+
+
+def clear_history(user_id: int) -> None:
+    with sqlite3.connect(HISTORY_DB) as connection:
+        connection.execute("DELETE FROM conversation_history WHERE user_id = ?", (user_id,))
+        connection.commit()
+
+
+def history_prompt(history: list[tuple[str, str]], prompt: str) -> str:
+    if not history:
+        return prompt
+    transcript = "\n".join(f"{role}: {content}" for role, content in history)
+    return f"Контекст предыдущего диалога:\n{transcript}\n\nНовый запрос пользователя:\n{prompt}"
+
+
+async def hf_text(
+    client: InferenceClient,
+    prompt: str,
+    mode: Mode,
+    history: list[tuple[str, str]] | None = None,
+) -> str:
     system = {
         Mode.CHAT: "Отвечай на русском ясно и полезно.",
         Mode.CODE: "Ты опытный разработчик. Дай рабочий код и кратко объясни решение.",
@@ -130,7 +191,8 @@ async def hf_text(client: InferenceClient, prompt: str, mode: Mode) -> str:
                 "role": "user",
                 "content": (
                     "Оформи ответ аккуратно: используй Markdown-заголовки, списки, "
-                    "таблицы и блоки кода. Формулы пиши без $...$.\n\n" + prompt
+                    "таблицы и блоки кода. Формулы пиши без $...$.\n\n"
+                    + history_prompt(history or [], prompt)
                 ),
             },
         ],
@@ -151,7 +213,12 @@ def choose_text_backend(settings: Settings, mode: Mode, prompt: str) -> str:
     return "gemini" if settings.gemini_api_key else "deepseek"
 
 
-async def gemini_text(settings: Settings, prompt: str, mode: Mode) -> str:
+async def gemini_text(
+    settings: Settings,
+    prompt: str,
+    mode: Mode,
+    history: list[tuple[str, str]] | None = None,
+) -> str:
     client = genai.Client(api_key=settings.gemini_api_key)
     instruction = {
         Mode.CHAT: "Отвечай по-русски ясно, точно и полезно.",
@@ -165,7 +232,7 @@ async def gemini_text(settings: Settings, prompt: str, mode: Mode) -> str:
             f"{instruction}\n"
             "Используй Markdown: заголовки, списки, жирный текст, блоки кода и таблицы. "
             "Формулы пиши читабельно и не используй LaTeX-делимитеры $...$.\n\n"
-            f"{prompt}"
+            f"{history_prompt(history or [], prompt)}"
         ),
     )
     return result.text
@@ -406,6 +473,16 @@ async def cancel_command(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(Command("clearhistory"))
+async def clear_history_command(message: Message, state: FSMContext) -> None:
+    await asyncio.to_thread(clear_history, message.from_user.id)
+    await state.clear()
+    await message.answer(
+        "🗑 История диалога удалена.\n\nВыберите режим для нового разговора:",
+        reply_markup=main_menu(),
+    )
+
+
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -425,6 +502,19 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=main_menu(),
     )
     await callback.answer("Отменено")
+
+
+@router.callback_query(F.data == "history:clear")
+async def clear_history_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    clear_history(callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text(
+        "🗑 <b>История очищена</b>\n\n"
+        "Начнём новый диалог. Выберите нужный режим:",
+        reply_markup=main_menu(),
+        parse_mode="HTML",
+    )
+    await callback.answer("История удалена")
 
 
 @router.callback_query(F.data == "about")
@@ -459,17 +549,22 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
         return
     status = await thinking(message)
     try:
+        history = await asyncio.to_thread(load_history, message.from_user.id)
         backend = choose_text_backend(settings, mode, message.text)
         if backend == "gemini":
             try:
-                answer = await gemini_text(settings, message.text, mode)
+                answer = await gemini_text(settings, message.text, mode, history)
             except Exception:
                 logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
                 answer = await hf_text(
-                    InferenceClient(token=settings.hf_token), message.text, mode
+                    InferenceClient(token=settings.hf_token), message.text, mode, history
                 )
         else:
-            answer = await hf_text(InferenceClient(token=settings.hf_token), message.text, mode)
+            answer = await hf_text(
+                InferenceClient(token=settings.hf_token), message.text, mode, history
+            )
+        await asyncio.to_thread(save_history, message.from_user.id, "user", message.text)
+        await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
         await send_answer(message, answer)
     except Exception as error:
         await send_error(message, error)
@@ -532,12 +627,16 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
             )
             if settings.gemini_api_key:
                 try:
-                    answer = await gemini_text(settings, prompt, mode)
+                    history = await asyncio.to_thread(load_history, message.from_user.id)
+                    answer = await gemini_text(settings, prompt, mode, history)
                 except Exception:
                     logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
-                    answer = await hf_text(client, prompt, mode)
+                    answer = await hf_text(client, prompt, mode, history)
             else:
-                answer = await hf_text(client, prompt, mode)
+                history = await asyncio.to_thread(load_history, message.from_user.id)
+                answer = await hf_text(client, prompt, mode, history)
+        await asyncio.to_thread(save_history, message.from_user.id, "user", "[Изображение]\n" + extracted)
+        await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
         await send_answer(message, answer)
     except Exception as error:
         await send_error(message, error)
@@ -612,6 +711,7 @@ async def edit_request(
 
 async def main() -> None:
     settings = Settings.from_env()
+    init_history()
     bot = Bot(settings.telegram_token)
     try:
         await bot.set_my_commands(
@@ -620,6 +720,7 @@ async def main() -> None:
                 BotCommand(command="help", description="Помощь"),
                 BotCommand(command="about", description="О боте"),
                 BotCommand(command="cancel", description="Отменить режим"),
+                BotCommand(command="clearhistory", description="Очистить историю"),
             ]
         )
     except TelegramAPIError:
