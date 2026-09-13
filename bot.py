@@ -486,17 +486,29 @@ async def clear_thinking(status: Message) -> None:
         logging.debug("Could not remove thinking status", exc_info=True)
 
 
+async def send_main_menu(message: Message, caption: str) -> None:
+    image = Path(__file__).with_name("assets").joinpath("elyra_welcome.png")
+    if image.exists():
+        await message.answer_photo(
+            FSInputFile(image),
+            caption=caption,
+            reply_markup=main_menu(),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(caption, reply_markup=main_menu(), parse_mode="HTML")
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
+    await send_main_menu(
+        message,
         "✨ <b>Добро пожаловать в Elyra!</b>\n\n"
         "Я помогу разобраться с задачей, объяснить сложную тему, "
         "написать код или решить пример с фотографии.\n\n"
         "💬 Напиши вопрос или отправь фото — я сразу начну помогать.\n\n"
         "👇 Выбери нужный режим:",
-        reply_markup=main_menu(),
-        parse_mode="HTML",
     )
 
 
@@ -517,9 +529,9 @@ async def about_command(message: Message) -> None:
 @router.message(Command("cancel"))
 async def cancel_command(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
+    await send_main_menu(
+        message,
         "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
-        reply_markup=main_menu(),
     )
 
 
@@ -527,19 +539,18 @@ async def cancel_command(message: Message, state: FSMContext) -> None:
 async def clear_history_command(message: Message, state: FSMContext) -> None:
     await asyncio.to_thread(clear_history, message.from_user.id)
     await state.clear()
-    await message.answer(
+    await send_main_menu(
+        message,
         "🗑 История диалога удалена.\n\nВыберите режим для нового разговора:",
-        reply_markup=main_menu(),
     )
 
 
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text(
+    await send_main_menu(
+        callback.message,
         "✨ <b>Elyra</b>\n\nВыберите режим работы:",
-        reply_markup=main_menu(),
-        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -547,16 +558,10 @@ async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "cancel")
 async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    try:
-        await callback.message.edit_text(
-            "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
-            reply_markup=main_menu(),
-        )
-    except TelegramBadRequest:
-        await callback.message.answer(
-            "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
-            reply_markup=main_menu(),
-        )
+    await send_main_menu(
+        callback.message,
+        "✅ Текущий запрос отменён.\n\nВыберите, что сделаем дальше:",
+    )
     await callback.answer("Отменено")
 
 
@@ -564,11 +569,10 @@ async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
 async def clear_history_callback(callback: CallbackQuery, state: FSMContext) -> None:
     clear_history(callback.from_user.id)
     await state.clear()
-    await callback.message.edit_text(
+    await send_main_menu(
+        callback.message,
         "🗑 <b>История очищена</b>\n\n"
         "Начнём новый диалог. Выберите нужный режим:",
-        reply_markup=main_menu(),
-        parse_mode="HTML",
     )
     await callback.answer("История удалена")
 
