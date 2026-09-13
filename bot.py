@@ -290,7 +290,16 @@ def is_hf_error(error: Exception) -> bool:
     text = str(error).lower()
     return any(
         marker in text
-        for marker in ("hugging face", "huggingface", "inference", "401", "402", "403")
+        for marker in (
+            "hugging face",
+            "huggingface",
+            "inference",
+            "whisper",
+            "hf_token",
+            "401",
+            "402",
+            "403",
+        )
     )
 
 
@@ -814,23 +823,17 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
         file = await bot.get_file(media.file_id)
         buffer = await bot.download_file(file.file_path)
         content = buffer.read()
-        mime_type = "audio/ogg" if message.voice else (media.mime_type or "audio/mpeg")
         try:
             prompt = await asyncio.wait_for(
                 hf_transcribe(InferenceClient(token=settings.hf_token), content),
                 timeout=90,
             )
-        except Exception:
-            logging.warning("Whisper transcription failed; using Gemini fallback", exc_info=True)
-            if not settings.gemini_api_key:
-                raise RuntimeError(
-                    "Не удалось расшифровать голос через Whisper. "
-                    "Проверьте HF_TOKEN или добавьте GEMINI_API_KEY."
-                )
-            prompt = await asyncio.wait_for(
-                gemini_transcribe(settings, content, mime_type),
-                timeout=90,
-            )
+        except Exception as error:
+            logging.warning("Whisper transcription failed", exc_info=True)
+            raise RuntimeError(
+                "Не удалось расшифровать голос через Whisper. "
+                "Проверьте HF_TOKEN и доступность модели Whisper."
+            ) from error
         if not prompt:
             raise RuntimeError("Расшифровка голосового сообщения пуста.")
         history = await asyncio.to_thread(load_history, message.from_user.id)
