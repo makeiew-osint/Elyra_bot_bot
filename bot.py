@@ -276,6 +276,15 @@ async def gemini_transcribe(settings: Settings, content: bytes, mime_type: str) 
     return (result.text or "").strip()
 
 
+async def hf_transcribe(client: InferenceClient, content: bytes) -> str:
+    result = await asyncio.to_thread(
+        client.automatic_speech_recognition,
+        content,
+        model="openai/whisper-large-v3-turbo",
+    )
+    return (getattr(result, "text", "") or "").strip()
+
+
 async def synthesize_speech(text: str, voice: str) -> tuple[bytes, str]:
     """Return Telegram-compatible voice bytes when ffmpeg is available."""
     import edge_tts
@@ -756,10 +765,18 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
     try:
         file = await bot.get_file(message.voice.file_id)
         buffer = await bot.download_file(file.file_path)
-        prompt = await asyncio.wait_for(
-            gemini_transcribe(settings, buffer.read(), "audio/ogg"),
-            timeout=90,
-        )
+        content = buffer.read()
+        try:
+            prompt = await asyncio.wait_for(
+                gemini_transcribe(settings, content, "audio/ogg"),
+                timeout=90,
+            )
+        except Exception:
+            logging.warning("Gemini transcription failed; using Whisper fallback", exc_info=True)
+            prompt = await asyncio.wait_for(
+                hf_transcribe(InferenceClient(token=settings.hf_token), content),
+                timeout=90,
+            )
         if not prompt:
             raise RuntimeError("Расшифровка голосового сообщения пуста.")
         history = await asyncio.to_thread(load_history, message.from_user.id)
