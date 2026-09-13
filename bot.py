@@ -371,9 +371,11 @@ async def clear_thinking(status: Message) -> None:
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "✨ <b>Привет! Я Elyra</b>\n\n"
-        "Помогу решить задачу текстом или по фотографии. "
-        "Выберите нужный режим:",
+        "✨ <b>Добро пожаловать в Elyra!</b>\n\n"
+        "Я помогу разобраться с задачей, объяснить сложную тему, "
+        "написать код или решить пример с фотографии.\n\n"
+        "💬 Напиши вопрос или отправь фото — я сразу начну помогать.\n\n"
+        "👇 Выбери нужный режим:",
         reply_markup=main_menu(),
         parse_mode="HTML",
     )
