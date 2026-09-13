@@ -3,11 +3,8 @@ import base64
 import html
 import io
 import logging
-import os
 import re
-import shutil
 import sqlite3
-import subprocess
 import tempfile
 from enum import Enum
 from pathlib import Path
@@ -283,34 +280,6 @@ async def hf_transcribe(client: InferenceClient, content: bytes) -> str:
         model="openai/whisper-large-v3-turbo",
     )
     return (getattr(result, "text", "") or "").strip()
-
-
-async def synthesize_speech(text: str, voice: str) -> tuple[bytes, str]:
-    """Return Telegram-compatible voice bytes when ffmpeg is available."""
-    import edge_tts
-
-    runtime = Path(__file__).with_name(".runtime")
-    runtime.mkdir(exist_ok=True)
-    mp3_path = runtime / f"tts_{os.getpid()}_{id(text)}.mp3"
-    await edge_tts.Communicate(text[:4000], voice).save(str(mp3_path))
-    ogg_path = mp3_path.with_suffix(".ogg")
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        try:
-            await asyncio.to_thread(
-                subprocess.run,
-                [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp3_path),
-                 "-c:a", "libopus", "-b:a", "64k", str(ogg_path)],
-                check=True,
-                capture_output=True,
-            )
-            return ogg_path.read_bytes(), "voice.ogg"
-        finally:
-            mp3_path.unlink(missing_ok=True)
-            ogg_path.unlink(missing_ok=True)
-    content = mp3_path.read_bytes()
-    mp3_path.unlink(missing_ok=True)
-    return content, "voice.mp3"
 
 
 async def hf_image(client: InferenceClient, prompt: str, model: str) -> bytes:
@@ -798,25 +767,8 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
             )
         await asyncio.to_thread(save_history, message.from_user.id, "user", "[Голос]\n" + prompt)
         await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
+        await message.answer(f"📝 <b>Расшифровка:</b>\n{html.escape(prompt)}", parse_mode="HTML")
         await send_answer(message, answer)
-        try:
-            audio, filename = await asyncio.wait_for(
-                synthesize_speech(answer, settings.tts_voice),
-                timeout=90,
-            )
-            if filename.endswith(".ogg"):
-                await message.answer_voice(BufferedInputFile(audio, filename=filename))
-            else:
-                await message.answer_audio(
-                    BufferedInputFile(audio, filename=filename),
-                    caption="🔊 TTS в MP3: ffmpeg не найден, поэтому отправлен аудиофайл.",
-                )
-        except Exception:
-            logging.warning("Voice synthesis failed; text answer was sent", exc_info=True)
-            await message.answer(
-                "🔊 Голосовой ответ временно недоступен, но текстовый ответ уже отправлен.",
-                reply_markup=back_menu(),
-            )
     except Exception as error:
         await send_error(message, error)
     finally:
