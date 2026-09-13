@@ -706,12 +706,32 @@ async def image_request(message: Message, state: FSMContext, settings: Settings)
     status = await thinking(message)
     try:
         client = InferenceClient(token=settings.hf_token)
-        image, model = await generate_image_with_fallback(client, message.text)
+        history = await asyncio.to_thread(load_history, message.from_user.id)
+        previous_prompts = [
+            content.removeprefix("[Генерация изображения]\n")
+            for role, content in history
+            if role == "user" and content.startswith("[Генерация изображения]")
+        ]
+        prompt = message.text
+        if previous_prompts:
+            prompt = (
+                "Это продолжение работы над изображением. Учти предыдущее описание:\n"
+                + previous_prompts[-1]
+                + "\n\nНовое изменение пользователя:\n"
+                + message.text
+            )
+        image, _model = await generate_image_with_fallback(client, prompt)
         path = temporary_image_path(image)
         await message.answer_photo(
             FSInputFile(path),
-            caption=f"Готово ✨\nВыбрана модель: {model.split('/')[-1]}",
+            caption="Готово ✨",
             reply_markup=back_menu(),
+        )
+        await asyncio.to_thread(
+            save_history, message.from_user.id, "user", "[Генерация изображения]\n" + message.text
+        )
+        await asyncio.to_thread(
+            save_history, message.from_user.id, "assistant", "[Изображение создано]"
         )
         path.unlink(missing_ok=True)
         await state.clear()
