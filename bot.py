@@ -268,7 +268,10 @@ async def gemini_vision_answer(
         client.models.generate_content,
         model=GEMINI_MODEL,
         contents=[
-            types.Part.from_bytes(data=content, mime_type="image/jpeg"),
+            types.Part.from_bytes(
+                data=content,
+                mime_type=data_uri_for_image(content).split(";", 1)[0][5:],
+            ),
             prompt,
         ],
     )
@@ -489,8 +492,19 @@ async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Set
                     "Сохрани формулы, номера и все важные детали.",
                 )
             except Exception:
-                logging.warning("Gemini vision failed; using Hugging Face OCR", exc_info=True)
-                extracted = await hf_ocr(client, content)
+                logging.warning("Gemini vision failed; trying Hugging Face OCR", exc_info=True)
+                try:
+                    extracted = await hf_ocr(client, content)
+                except Exception:
+                    logging.warning(
+                        "GLM-OCR failed; using multimodal DeepSeek fallback", exc_info=True
+                    )
+                    extracted = await hf_vision_answer(
+                        client,
+                        content,
+                        "Точно распознай текст и условие задачи на фотографии. "
+                        "Сохрани формулы, номера и все важные детали.",
+                    )
         else:
             try:
                 extracted = await hf_ocr(client, content)
