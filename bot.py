@@ -722,8 +722,7 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
         await clear_thinking(status)
 
 
-@router.message(F.voice)
-@router.message(F.audio)
+@router.message(F.content_type.in_({"voice", "audio"}))
 async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
     if not settings.gemini_api_key:
         await message.answer(
@@ -733,7 +732,7 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
         return
     status = await thinking(message)
     try:
-        media = message.voice or message.audio
+        media = message.voice if message.content_type == "voice" else message.audio
         if media is None:
             raise RuntimeError("Голосовое сообщение не содержит аудиофайл.")
         file = await bot.get_file(media.file_id)
