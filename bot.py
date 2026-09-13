@@ -51,16 +51,16 @@ def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🧠 Чат", callback_data="mode:chat"),
-                InlineKeyboardButton(text="💻 Кодинг", callback_data="mode:code"),
+                InlineKeyboardButton(text="🧠 Умный чат", callback_data="mode:chat"),
+                InlineKeyboardButton(text="💻 Решить код", callback_data="mode:code"),
             ],
             [
                 InlineKeyboardButton(text="🤖 Агент", callback_data="mode:agent"),
-                InlineKeyboardButton(text="🖼️ Анализ фото", callback_data="mode:ocr"),
+                InlineKeyboardButton(text="📷 Решить фото", callback_data="mode:ocr"),
             ],
             [
-                InlineKeyboardButton(text="🎨 Генерация", callback_data="mode:image"),
-                InlineKeyboardButton(text="✏️ Редактирование", callback_data="mode:edit"),
+                InlineKeyboardButton(text="🎨 Создать картинку", callback_data="mode:image"),
+                InlineKeyboardButton(text="✏️ Изменить фото", callback_data="mode:edit"),
             ],
             [
                 InlineKeyboardButton(text="ℹ️ О боте", callback_data="about"),
@@ -80,12 +80,15 @@ def back_menu() -> InlineKeyboardMarkup:
 
 
 ABOUT_TEXT = (
-    "✨ Elyra_bot_bot — AI-помощник в Telegram.\n\n"
-    "🧠 Чат, кодинг и агент: DeepSeek V4.1 Flash\n"
-    "🖼️ Анализ изображений и OCR: GLM-OCR\n"
-    "🎨 Генерация изображений: Krea-2-Turbo\n"
-    "✏️ Редактирование изображений: FLUX.2-dev\n\n"
-    "Отправьте запрос после выбора режима. Поддержка: @Makeiew"
+    "✨ <b>Elyra</b> — твой AI-помощник в Telegram.\n\n"
+    "🧠 <b>Умный чат</b> — вопросы и объяснения\n"
+    "💻 <b>Решить код</b> — программирование\n"
+    "🤖 <b>Агент</b> — планы и сложные задачи\n"
+    "📷 <b>Решить фото</b> — условие с картинки + решение\n"
+    "🎨 <b>Создать картинку</b> — генерация\n"
+    "✏️ <b>Изменить фото</b> — редактирование\n\n"
+    "Модели: DeepSeek V4.1 Flash, GLM-OCR, Krea-2-Turbo и FLUX.2-dev.\n"
+    "Поддержка: @Makeiew"
 )
 
 
@@ -166,8 +169,11 @@ async def send_error(message: Message, error: Exception) -> None:
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Я Elyra_bot_bot — AI-помощник.\nВыберите режим работы:",
+        "✨ <b>Привет! Я Elyra</b>\n\n"
+        "Помогу решить задачу текстом или по фотографии. "
+        "Выберите нужный режим:",
         reply_markup=main_menu(),
+        parse_mode="HTML",
     )
 
 
@@ -194,13 +200,17 @@ async def cancel_command(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text("Выберите режим работы:", reply_markup=main_menu())
+    await callback.message.edit_text(
+        "✨ <b>Elyra</b>\n\nВыберите режим работы:",
+        reply_markup=main_menu(),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "about")
 async def about_callback(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(ABOUT_TEXT, reply_markup=back_menu())
+    await callback.message.edit_text(ABOUT_TEXT, reply_markup=back_menu(), parse_mode="HTML")
     await callback.answer()
 
 
@@ -239,15 +249,24 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
 @router.message(UserFlow.waiting_for_prompt, F.photo)
 async def ocr_photo(message: Message, bot: Bot, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
-    if data.get("mode") != Mode.OCR.value:
-        await message.answer("В этом режиме нужен текстовый запрос.", reply_markup=back_menu())
-        return
     try:
+        mode = Mode(data["mode"])
         file = await bot.get_file(message.photo[-1].file_id)
         buffer = await bot.download_file(file.file_path)
         client = InferenceClient(token=settings.hf_token)
-        answer = await hf_ocr(client, buffer.read())
-        await message.answer(answer[:4000] or "Текст не найден.", reply_markup=back_menu())
+        extracted = await hf_ocr(client, buffer.read())
+        if not extracted.strip():
+            await message.answer("Не удалось распознать текст на фото.", reply_markup=back_menu())
+            return
+        if mode == Mode.OCR:
+            answer = extracted
+        else:
+            prompt = (
+                f"Реши задачу, распознанную с фотографии. "
+                f"Покажи ход решения и итоговый ответ.\n\n{extracted}"
+            )
+            answer = await hf_text(client, prompt, mode)
+        await message.answer(answer[:4000], reply_markup=back_menu())
     except Exception as error:
         await send_error(message, error)
 
