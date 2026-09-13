@@ -285,6 +285,27 @@ async def gemini_search(settings: Settings, prompt: str) -> str:
     return result.text
 
 
+async def answer_smart_text(
+    settings: Settings,
+    prompt: str,
+    history: list[tuple[str, str]],
+) -> str:
+    mode = smart_mode(prompt)
+    if mode == Mode.SEARCH:
+        if settings.gemini_api_key:
+            try:
+                return await gemini_search(settings, prompt)
+            except Exception:
+                logging.warning("Grounded search failed; using regular model fallback", exc_info=True)
+        mode = Mode.CHAT
+    if choose_text_backend(settings, mode, prompt) == "gemini":
+        try:
+            return await gemini_text(settings, prompt, mode, history)
+        except Exception:
+            logging.warning("Gemini smart answer failed; using DeepSeek fallback", exc_info=True)
+    return await hf_text(InferenceClient(token=settings.hf_token), prompt, mode, history)
+
+
 async def gemini_transcribe(settings: Settings, content: bytes, mime_type: str) -> str:
     client = genai.Client(api_key=settings.gemini_api_key)
     result = await asyncio.to_thread(
@@ -722,29 +743,29 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
     status = await thinking(message)
     try:
         history = await asyncio.to_thread(load_history, message.from_user.id)
-        selected_mode = smart_mode(message.text) if mode == Mode.CHAT else mode
-        if selected_mode == Mode.SEARCH:
-            if not settings.gemini_api_key:
-                raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
-            answer = await gemini_search(settings, message.text)
-        elif choose_text_backend(settings, selected_mode, message.text) == "gemini":
-            try:
-                answer = await gemini_text(settings, message.text, selected_mode, history)
-            except Exception:
-                logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
-                answer = await hf_text(
-                    InferenceClient(token=settings.hf_token),
-                    message.text,
-                    selected_mode,
-                    history,
-                )
+        if mode == Mode.CHAT:
+            answer = await answer_smart_text(settings, message.text, history)
         else:
-            answer = await hf_text(
-                InferenceClient(token=settings.hf_token),
-                message.text,
-                selected_mode,
-                history,
-            )
+            if mode == Mode.SEARCH:
+                if not settings.gemini_api_key:
+                    raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
+                try:
+                    answer = await gemini_search(settings, message.text)
+                except Exception:
+                    logging.warning("Search failed; using regular smart answer", exc_info=True)
+                    answer = await answer_smart_text(settings, message.text, history)
+            elif choose_text_backend(settings, mode, message.text) == "gemini":
+                try:
+                    answer = await gemini_text(settings, message.text, mode, history)
+                except Exception:
+                    logging.warning("Gemini failed; falling back to DeepSeek", exc_info=True)
+                    answer = await hf_text(
+                        InferenceClient(token=settings.hf_token), message.text, mode, history
+                    )
+            else:
+                answer = await hf_text(
+                    InferenceClient(token=settings.hf_token), message.text, mode, history
+                )
         await asyncio.to_thread(save_history, message.from_user.id, "user", message.text)
         await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
         await send_answer(message, answer)
@@ -785,28 +806,10 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
         if not prompt:
             raise RuntimeError("Расшифровка голосового сообщения пуста.")
         history = await asyncio.to_thread(load_history, message.from_user.id)
-        selected_mode = smart_mode(prompt)
-        if selected_mode == Mode.SEARCH:
-            if not settings.gemini_api_key:
-                raise RuntimeError("Для поиска в интернете требуется GEMINI_API_KEY.")
-            answer = await asyncio.wait_for(gemini_search(settings, prompt), timeout=90)
-        elif choose_text_backend(settings, selected_mode, prompt) == "gemini":
-            try:
-                answer = await asyncio.wait_for(
-                    gemini_text(settings, prompt, selected_mode, history),
-                    timeout=90,
-                )
-            except Exception:
-                logging.warning("Gemini voice answer failed; falling back to DeepSeek", exc_info=True)
-                answer = await asyncio.wait_for(
-                    hf_text(InferenceClient(token=settings.hf_token), prompt, selected_mode, history),
-                    timeout=90,
-                )
-        else:
-            answer = await asyncio.wait_for(
-                hf_text(InferenceClient(token=settings.hf_token), prompt, selected_mode, history),
-                timeout=90,
-            )
+        answer = await asyncio.wait_for(
+            answer_smart_text(settings, prompt, history),
+            timeout=120,
+        )
         await asyncio.to_thread(save_history, message.from_user.id, "user", "[Голос]\n" + prompt)
         await asyncio.to_thread(save_history, message.from_user.id, "assistant", answer)
         await message.answer(f"📝 <b>Расшифровка:</b>\n{html.escape(prompt)}", parse_mode="HTML")
