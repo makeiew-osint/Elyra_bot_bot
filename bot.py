@@ -30,6 +30,8 @@ from google.genai import types
 from config import (
     EDIT_MODEL,
     GEMINI_MODEL,
+    IMAGE_FAST_MODEL,
+    IMAGE_REALISTIC_MODEL,
     IMAGE_MODEL,
     OCR_MODEL,
     REASONING_MODEL,
@@ -243,6 +245,42 @@ async def hf_image(client: InferenceClient, prompt: str, model: str) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
         image.save(handle, format="PNG")
         return Path(handle.name).read_bytes()
+
+
+def choose_image_models(prompt: str) -> list[str]:
+    lowered = prompt.lower()
+    realistic_words = (
+        "фотореалист", "реалистич", "портрет", "фото", "photorealistic",
+        "realistic", "portrait", "product", "товар", "архитектур",
+    )
+    fast_words = (
+        "быстро", "просто", "икон", "логотип", "стикер", "мультяш",
+        "аниме", "скетч", "эскиз", "simple", "icon", "logo", "sticker",
+        "anime", "cartoon",
+    )
+    if any(word in lowered for word in realistic_words):
+        preferred = IMAGE_REALISTIC_MODEL
+    elif any(word in lowered for word in fast_words):
+        preferred = IMAGE_FAST_MODEL
+    else:
+        preferred = IMAGE_MODEL
+    return [preferred] + [
+        model for model in (IMAGE_MODEL, IMAGE_REALISTIC_MODEL, IMAGE_FAST_MODEL)
+        if model != preferred
+    ]
+
+
+async def generate_image_with_fallback(
+    client: InferenceClient, prompt: str
+) -> tuple[bytes, str]:
+    last_error: Exception | None = None
+    for model in choose_image_models(prompt):
+        try:
+            return await hf_image(client, prompt, model), model
+        except Exception as error:
+            last_error = error
+            logging.warning("Image model %s failed; trying next model", model, exc_info=True)
+    raise RuntimeError("All image generation models failed") from last_error
 
 
 def temporary_image_path(content: bytes) -> Path:
@@ -665,15 +703,22 @@ async def ocr_document(message: Message, bot: Bot, state: FSMContext, settings: 
 
 @router.message(UserFlow.waiting_for_image_prompt, F.text)
 async def image_request(message: Message, state: FSMContext, settings: Settings) -> None:
+    status = await thinking(message)
     try:
         client = InferenceClient(token=settings.hf_token)
-        image = await hf_image(client, message.text, IMAGE_MODEL)
+        image, model = await generate_image_with_fallback(client, message.text)
         path = temporary_image_path(image)
-        await message.answer_photo(FSInputFile(path), caption="Готово ✨", reply_markup=back_menu())
+        await message.answer_photo(
+            FSInputFile(path),
+            caption=f"Готово ✨\nВыбрана модель: {model.split('/')[-1]}",
+            reply_markup=back_menu(),
+        )
         path.unlink(missing_ok=True)
         await state.clear()
     except Exception as error:
         await send_error(message, error)
+    finally:
+        await clear_thinking(status)
 
 
 @router.message(UserFlow.waiting_for_edit_image, F.photo)
