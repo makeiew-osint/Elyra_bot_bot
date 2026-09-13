@@ -723,6 +723,7 @@ async def text_request(message: Message, state: FSMContext, settings: Settings) 
 
 
 @router.message(F.voice)
+@router.message(F.audio)
 async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
     if not settings.gemini_api_key:
         await message.answer(
@@ -732,12 +733,16 @@ async def voice_request(message: Message, bot: Bot, settings: Settings) -> None:
         return
     status = await thinking(message)
     try:
-        file = await bot.get_file(message.voice.file_id)
+        media = message.voice or message.audio
+        if media is None:
+            raise RuntimeError("Голосовое сообщение не содержит аудиофайл.")
+        file = await bot.get_file(media.file_id)
         buffer = await bot.download_file(file.file_path)
         content = buffer.read()
+        mime_type = "audio/ogg" if message.voice else (media.mime_type or "audio/mpeg")
         try:
             prompt = await asyncio.wait_for(
-                gemini_transcribe(settings, content, "audio/ogg"),
+                gemini_transcribe(settings, content, mime_type),
                 timeout=90,
             )
         except Exception:
