@@ -17,6 +17,7 @@ class Settings:
     daily_message_limit: int
     max_file_size_mb: int
     healthcheck_interval_minutes: int
+    maintenance_mode: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -42,6 +43,8 @@ class Settings:
             daily_message_limit=max(0, int(os.getenv("DAILY_MESSAGE_LIMIT", "100"))),
             max_file_size_mb=max(1, int(os.getenv("MAX_FILE_SIZE_MB", "20"))),
             healthcheck_interval_minutes=max(1, int(os.getenv("HEALTHCHECK_INTERVAL_MINUTES", "15"))),
+            maintenance_mode=os.getenv("MAINTENANCE_MODE", "true").strip().lower()
+            in ("1", "true", "yes", "on", "вкл"),
         )
 
 

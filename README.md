@@ -37,6 +37,8 @@ Telegram-бот с единым меню для чата, кода, агента
 - `DAILY_MESSAGE_LIMIT=100`;
 - `MAX_FILE_SIZE_MB=20`;
 - `HEALTHCHECK_INTERVAL_MINUTES=15`.
+- `MAINTENANCE_MODE=true` — включить режим технических работ для пользователей
+  (администратор `1881090493` сохраняет доступ).
 
 Конфигурация запуска находится в `railway.toml`; Railway запускает worker-команду
 `python bot.py`. Не загружайте `.env` в репозиторий.

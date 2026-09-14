@@ -993,7 +993,19 @@ async def about_callback(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("mode:"))
-async def mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
+async def mode_callback(
+    callback: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if HEALTH_STATE["maintenance"] and not is_admin(
+        callback.from_user.id, settings
+    ):
+        await callback.message.answer(
+            "🛠 <b>Технические работы</b>\n\n"
+            "Бот временно недоступен. Попробуйте позже.",
+            parse_mode="HTML",
+        )
+        await callback.answer("Технические работы")
+        return
     mode = Mode(callback.data.split(":", 1)[1])
     await state.clear()
     if mode in (Mode.IMAGE, Mode.EDIT):
@@ -1364,6 +1376,7 @@ async def edit_request(
 
 async def main() -> None:
     settings = Settings.from_env()
+    HEALTH_STATE["maintenance"] = settings.maintenance_mode
     init_history(settings)
     bot = Bot(settings.telegram_token)
     global BOT_INSTANCE
