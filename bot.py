@@ -55,6 +55,8 @@ DB_POOL = None
 DB_SETTINGS = None
 BOT_INSTANCE = None
 HEALTH_STATE = {"last": 0.0, "api_errors": 0, "provider_errors": 0, "maintenance": False}
+# Keep the public bot closed until provider credits and deployment are restored.
+FORCE_MAINTENANCE_MODE = True
 
 
 class Mode(str, Enum):
@@ -1376,7 +1378,7 @@ async def edit_request(
 
 async def main() -> None:
     settings = Settings.from_env()
-    HEALTH_STATE["maintenance"] = settings.maintenance_mode
+    HEALTH_STATE["maintenance"] = FORCE_MAINTENANCE_MODE or settings.maintenance_mode
     init_history(settings)
     bot = Bot(settings.telegram_token)
     global BOT_INSTANCE
